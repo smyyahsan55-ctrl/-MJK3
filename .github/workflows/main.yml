@@ -5,25 +5,25 @@ on:
     branches: [ main ]
   schedule:
     - cron: '*/30 * * * *'
+  workflow_dispatch: # این باعث میشه بتونی دستی هم دکمه اجرا رو بزنی
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4 # نسخه جدیدتر
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5 # نسخه جدیدتر
         with:
-          python-version: '3.9'
+          python-version: '3.10' # یه نسخه پایدار و جدید
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pyTelegramBotAPI
+          pip install pyTelegramBotAPI maxrubika aiosqlite
 
       - name: Run Bot
         run: python bot.py
-concurrency:
-  
