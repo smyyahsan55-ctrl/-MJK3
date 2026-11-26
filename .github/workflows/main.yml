@@ -24,6 +24,6 @@ jobs:
           pip install pyTelegramBotAPI
 
       - name: Run Bot
-        run: python newfile.py
+        run: python اصلی 
 concurrency:
   
