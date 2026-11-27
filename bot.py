@@ -1,0 +1,4000 @@
+# -*- coding: utf-8 -*-
+import asyncio
+import json
+import os
+import time
+import random
+import string
+import uuid
+import re
+import datetime
+import shutil
+import unicodedata
+import hashlib
+import logging
+import aiosqlite
+from maxrubika import Bot
+
+BOT_MAKERS = "مدیریت ربات‌ساز"
+BOT_SUPPORT = ""
+
+MAIN_TOKEN = "CEEIFC0DSRADWWGQXFEVGZVPXHBDZZDSMBQYERQKJWUONUXWCDIVYGRKRZGFUTPY"
+MAKER_ADMIN_PASS = "alinaimi130009028206692"
+
+DATA_DIR = "maker_data"
+os.makedirs(DATA_DIR, exist_ok=True)
+MAKER_DB = os.path.join(DATA_DIR, "maker.db")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("maker_bot")
+
+main_bot = Bot(MAIN_TOKEN)
+
+maker_states = {}
+_admin_attempts = {}
+child_tasks = {}
+_maker_admin_cache = {}
+_MAKER_ADMIN_SESSIONS = set()
+_MAKER_ADMIN_CACHE_TTL = 60
+_processed_child_users = set()
+admin_cache = {}
+ADMIN_CACHE_TTL = 300
+
+
+def normalize_text(text):
+    if not text:
+        return ""
+    text = unicodedata.normalize('NFKC', str(text))
+    text = text.replace('\u200c', ' ').replace('\u200f', '').replace('\u200e', '')
+    text = text.replace('\u200b', '')
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def get_state(uid):
+    return maker_states.get(str(uid), {"state": None, "data": {}})
+
+
+def set_state(uid, state, **data):
+    maker_states[str(uid)] = {"state": state, "data": data}
+
+
+def clear_state(uid):
+    maker_states.pop(str(uid), None)
+
+
+BAD_WORDS_LONG = ["جاکش", "حرومزاده", "گوه", "مادرجنده"]
+BAD_WORDS_SHORT = ["کص", "کون", "کیر", "لعنت"]
+
+
+def contains_bad_word(text):
+    if not text:
+        return False
+    t = normalize_text(text).lower()
+    for w in BAD_WORDS_LONG:
+        if w in t:
+            return True
+    for w in BAD_WORDS_SHORT:
+        if re.search(r'(?<![آ-یa-zA-Z0-9])' + re.escape(w) + r'(?![آ-یa-zA-Z0-9])', t):
+            return True
+    return False
+
+
+LINK_PATTERNS = ["http://", "https://", "www.", "t.me", "rubika.ir", ".com", ".ir", ".net", ".org"]
+
+
+def contains_link(text):
+    if not text:
+        return False
+    tl = text.lower()
+    return any(x in tl for x in LINK_PATTERNS)
+
+
+def generate_ref_code(n=6):
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=n))
+
+
+def generate_order_code(n=6):
+    return ''.join(random.choices(string.digits, k=n))
+
+
+def generate_bot_id(uid):
+    return f"{str(uid)[:10]}_{uuid.uuid4().hex[:8]}"
+
+
+def hash_password(p):
+    return hashlib.sha256(str(p).encode('utf-8')).hexdigest()
+
+
+def is_private_chat(chat_id):
+    return str(chat_id).startswith("b0")
+
+
+def is_group_chat(chat_id):
+    cid = str(chat_id)
+    return cid.startswith("g0") or cid.startswith("c0")
+
+
+def make_keypad(rows):
+    out = []
+    for row in rows:
+        r = []
+        for item in row:
+            if isinstance(item, (tuple, list)):
+                r.append(str(item[0]))
+            else:
+                r.append(str(item))
+        out.append(r)
+    return out
+
+
+def main_menu_kb():
+    return make_keypad([
+        ["➕ ساخت ربات"],
+        ["📋 ربات های من", "👤 پروفایل"],
+        ["💳 خرید سکه", "💸 انتقال"],
+        ["⚙️ تنظیمات ربات ها"],
+        ["🔐 پنل مدیریت"],
+        ["👥 زیرمجموعه", "📞 پشتیبانی"],
+        ["💰 سکه روزانه", "🎁 کد هدیه"],
+        ["🏆 کاربران برتر"],
+    ])
+
+
+def admin_menu_kb():
+    return make_keypad([
+        ["👥 آمار کاربران"],
+        ["👥 لیست کاربران"],
+        ["💰 اضافه سکه", "📢 پیام همگانی"],
+        ["📢 پیام همگانی فرزندها"],
+        ["💳 پرداخت‌ها"],
+        ["🚫 بن کاربر", "✅ آنبن کاربر"],
+        ["✉️ پیام به کاربر"],
+        ["⚙️ سکه روزانه", "💳 شماره کارت"],
+        ["🎁 ساخت کد هدیه", "📋 لیست کدها"],
+        ["🔐 تغییر رمز"],
+        ["📨 پیام‌های پشتیبانی"],
+        ["🔙 بازگشت به منوی اصلی"],
+    ])
+
+
+def creation_menu_kb():
+    return make_keypad([
+        ["🤖 چت ناشناس (10)"],
+        ["👥 مدیریت گروه (15)"],
+        ["⚔️ جنگ جهانی (20)"],
+        ["🔙 بازگشت"],
+    ])
+
+
+def payment_kb():
+    return make_keypad([["✅ پرداخت کردم", "❌ لغو"]])
+
+
+def bot_settings_kb():
+    return make_keypad([
+        ["🔄 تغییر رمز"],
+        ["🔴 خاموش", "🟢 روشن"],
+        ["🗑️ حذف ربات"],
+        ["🔙 بازگشت"],
+    ])
+
+
+def cancel_kb():
+    return make_keypad([["❌ لغو"]])
+
+
+async def safe_send(bot, chat_id, text, keypad=None, reply_to=None):
+    kwargs = {}
+    if keypad is not None:
+        kwargs["chat_keypad"] = keypad
+    if reply_to:
+        kwargs["reply_to_message_id"] = reply_to
+    try:
+        await bot.send_message(chat_id, text, **kwargs)
+        return True
+    except Exception as e:
+        logger.warning(f"safe_send fail: {e}")
+        try:
+            await bot.send_message(chat_id, text)
+            return True
+        except Exception as e2:
+            logger.error(f"safe_send fail2: {e2}")
+            return False
+
+
+BUTTON_MAP = {
+    "➕ ساخت ربات": "➕ ساخت ربات",
+    "📋 ربات های من": "📋 ربات های من",
+    "📋 رباتهاي من": "📋 ربات های من",
+    "👤 پروفایل": "👤 پروفایل من",
+    "👤 پروفایل من": "👤 پروفایل من",
+    "💳 خرید سکه": "💳 خرید سکه",
+    "💸 انتقال": "💸 انتقال سکه",
+    "💸 انتقال سکه": "💸 انتقال سکه",
+    "⚙️ تنظیمات ربات ها": "⚙️ تنظیمات ربات ها",
+    "⚙️ تنظیمات": "⚙️ تنظیمات ربات ها",
+    "🔐 پنل مدیریت": "🔐 پنل مدیریت",
+    "🔐 پنل": "🔐 پنل مدیریت",
+    "👥 زیرمجموعه": "👥 زیر مجموعه گیری",
+    "👥 زیر مجموعه": "👥 زیر مجموعه گیری",
+    "👥 زیر مجموعه گیری": "👥 زیر مجموعه گیری",
+    "📞 پشتیبانی": "📞 پشتیبانی",
+    "💰 سکه روزانه": "💰 دریافت سکه روزانه",
+    "💰 دریافت سکه": "💰 دریافت سکه روزانه",
+    "💰 دریافت سکه روزانه": "💰 دریافت سکه روزانه",
+    "🎁 کد هدیه": "🎁 وارد کردن کد هدیه",
+    "🎁 وارد کردن کد هدیه": "🎁 وارد کردن کد هدیه",
+    "🏆 کاربران برتر": "🏆 کاربران برتر",
+    "🤖 چت ناشناس (10)": "🤖 چت ناشناس (10 سکه)",
+    "🤖 چت ناشناس (10 سکه)": "🤖 چت ناشناس (10 سکه)",
+    "🤖 چت ناشناس": "🤖 چت ناشناس (10 سکه)",
+    "👥 مدیریت گروه (15)": "👥 مدیریت گروه (15 سکه)",
+    "👥 مدیریت گروه (15 سکه)": "👥 مدیریت گروه (15 سکه)",
+    "👥 مدیریت گروه": "👥 مدیریت گروه (15 سکه)",
+    "⚔️ جنگ جهانی (20)": "⚔️ جنگ جهانی (20 سکه)",
+    "⚔️ جنگ جهانی (20 سکه)": "⚔️ جنگ جهانی (20 سکه)",
+    "⚔️ جنگ جهانی": "⚔️ جنگ جهانی (20 سکه)",
+    "❌ لغو": "❌ لغو",
+    "🔙 بازگشت": "🔙 بازگشت",
+    "✅ پرداخت کردم": "✅ پرداخت کردم",
+    "🔙 بازگشت به منوی اصلی": "🔙 بازگشت به منوی اصلی",
+    "🔄 تغییر رمز": "🔄 تغییر رمز مدیریت",
+    "🔄 تغییر رمز مدیریت": "🔄 تغییر رمز مدیریت",
+    "🔴 خاموش": "🔴 خاموش کردن ربات",
+    "🔴 خاموش کردن ربات": "🔴 خاموش کردن ربات",
+    "🟢 روشن": "🟢 روشن کردن ربات",
+    "🟢 روشن کردن ربات": "🟢 روشن کردن ربات",
+    "🗑️ حذف ربات": "🗑️ حذف ربات",
+    "📊 آمار": "📊 آمار ربات ساز",
+    "👥 آمار کاربران": "📊 آمار ربات ساز",
+    "📊 آمار ربات ساز": "📊 آمار ربات ساز",
+    "👥 لیست کاربران": "👥 لیست کاربران",
+    "💰 اضافه سکه": "💰 اضافه کردن سکه",
+    "💰 اضافه کردن سکه": "💰 اضافه کردن سکه",
+    "📢 پیام همگانی": "📢 پیام همگانی",
+    "🌍 پیام همه ربات‌ها": "🌍 پیام همگانی فرزندها",
+    "🌍 پیام همگانی همه ربات‌ها": "🌍 پیام همگانی فرزندها",
+    "📢 پیام همگانی فرزندها": "🌍 پیام همگانی فرزندها",
+    "🌍 پیام همگانی فرزندها": "🌍 پیام همگانی فرزندها",
+    "💳 پرداخت‌ها": "💳 مشاهده پرداخت‌ها",
+    "💳 مشاهده پرداخت‌ها": "💳 مشاهده پرداخت‌ها",
+    "🚫 بن کاربر": "🚫 بن کاربر",
+    "✅ آنبن کاربر": "✅ آنبن کاربر",
+    "✉️ پیام به کاربر": "✉️ ارسال پیام به کاربر",
+    "✉️ ارسال پیام به کاربر": "✉️ ارسال پیام به کاربر",
+    "⚙️ سکه روزانه": "⚙️ تنظیم سکه روزانه",
+    "⚙️ تنظیم سکه روزانه": "⚙️ تنظیم سکه روزانه",
+    "💳 شماره کارت": "💳 تنظیم شماره کارت",
+    "💳 تنظیم شماره کارت": "💳 تنظیم شماره کارت",
+    "🎁 ساخت کد هدیه": "🎁 ساخت کد هدیه",
+    "📋 لیست کدها": "📋 لیست کدهای هدیه",
+    "📋 لیست کدهای هدیه": "📋 لیست کدهای هدیه",
+    "🔐 تغییر رمز": "🔐 تغییر رمز مدیریت",
+    "🔐 تغییر رمز مدیریت": "🔐 تغییر رمز مدیریت",
+    "📨 پیام‌های پشتیبانی": "📨 پیام‌های پشتیبانی",
+    "💬 چت ناشناس": "💬 چت ناشناس",
+    "👥 چت گروهی": "👥 چت گروهی",
+    "📊 موجودی": "📊 موجودی من",
+    "📊 موجودی من": "📊 موجودی من",
+    "❌ لغو جستجو": "❌ لغو جستجو",
+    "❌ پایان چت": "❌ پایان چت",
+    "🚪 خروج از گروه": "🚪 خروج از گروه",
+    "📈 آمار کاربران": "📈 آمار کاربران",
+    "🎁 ایجاد کد هدیه": "🎁 ایجاد کد هدیه",
+    "💰 تنظیم قیمت سکه": "💰 تنظیم قیمت سکه",
+    "🔙 خروج از پنل": "🔙 خروج از پنل",
+    "➕ افزایش سکه": "➕ افزایش سکه",
+    "🔄 صفر کردن سکه": "🔄 صفر کردن سکه",
+    "📚 آموزش": "📚 آموزش فعال‌سازی",
+    "📚 آموزش فعال‌سازی": "📚 آموزش فعال‌سازی",
+    "📢 کانال دستورات": "📢 کانال دستورات",
+    "✅ بالای 18 ساله": "✅ بالای 18 ساله",
+    "❌ زیر 18 ساله": "❌ زیر 18 ساله",
+    "✅ تایید می‌کنم": "✅ تایید می‌کنم",
+    "❌ انصراف می‌دهم": "❌ انصراف می‌دهم",
+    "👤 پروفایل": "👤 پروفایل",
+    "🌍 کشور من": "🌍 کشور من",
+    "⛏️ معدن": "⛏️ معدن",
+    "🛒 بازار سلاح": "🛒 بازار سلاح",
+    "🤝 اتحاد": "🤝 اتحاد",
+    "💱 تجارت": "💱 تجارت",
+    "⚔️ حمله": "⚔️ حمله",
+    "📊 رتبه‌بندی": "📊 رتبه‌بندی",
+    "📣 بیانیه": "📣 بیانیه",
+    "🛡️ پنل مدیریت": "🛡️ پنل مدیریت",
+    "ℹ️ راهنما": "ℹ️ راهنما",
+    "➕ ساخت اتحاد": "➕ ساخت اتحاد",
+}
+
+
+def resolve_button(raw):
+    if not raw:
+        return ""
+    t = normalize_text(raw).replace('\u200c', ' ')
+    t = re.sub(r'\s+', ' ', t).strip()
+    if t in BUTTON_MAP:
+        return BUTTON_MAP[t]
+    for pref in ("buy_", "settings_", "quickreply_", "کشورانتخاب:", "خریدسلاح:",
+                 "اتحاد:", "پیوستن:", "کشورها:"):
+        if t.startswith(pref):
+            return t
+    if t.startswith("/"):
+        return t
+    if t.startswith("تایید") or t.startswith("تأیید") or t == "رد" or t.startswith("رد "):
+        return t
+    for kw, target in [
+        ("ساخت ربات", "➕ ساخت ربات"),
+        ("ربات های من", "📋 ربات های من"),
+        ("پروفایل", "👤 پروفایل من"),
+        ("خرید سکه", "💳 خرید سکه"),
+        ("انتقال", "💸 انتقال سکه"),
+        ("پنل مدیریت", "🔐 پنل مدیریت"),
+        ("پشتیبانی", "📞 پشتیبانی"),
+        ("سکه روزانه", "💰 دریافت سکه روزانه"),
+        ("کد هدیه", "🎁 وارد کردن کد هدیه"),
+        ("کاربران برتر", "🏆 کاربران برتر"),
+        ("چت ناشناس", "🤖 چت ناشناس (10 سکه)"),
+        ("مدیریت گروه", "👥 مدیریت گروه (15 سکه)"),
+        ("جنگ جهانی", "⚔️ جنگ جهانی (20 سکه)"),
+        ("آموزش فعال", "📚 آموزش فعال‌سازی"),
+        ("کانال دستورات", "📢 کانال دستورات"),
+        ("بازگشت به منو", "🔙 بازگشت به منوی اصلی"),
+        ("بازگشت", "🔙 بازگشت"),
+        ("لغو", "❌ لغو"),
+    ]:
+        if kw in t:
+            return target
+    return t
+
+
+async def db_connect():
+    return await aiosqlite.connect(MAKER_DB)
+
+
+async def db_init():
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("PRAGMA journal_mode=WAL;")
+            await c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                uid TEXT PRIMARY KEY, name TEXT, username TEXT,
+                coins INTEGER DEFAULT 0, invited_by TEXT,
+                banned INTEGER DEFAULT 0, daily_claimed TEXT,
+                ref_code TEXT UNIQUE, used_gift_codes TEXT DEFAULT '[]'
+            )""")
+            await c.execute("""
+            CREATE TABLE IF NOT EXISTS bots (
+                bot_id TEXT PRIMARY KEY, owner_id TEXT, token TEXT,
+                password TEXT, plain_password TEXT, bot_type TEXT,
+                is_active INTEGER DEFAULT 1, created_at INTEGER
+            )""")
+            await c.execute("CREATE TABLE IF NOT EXISTS admins (uid TEXT PRIMARY KEY)")
+            await c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+            await c.execute("""
+            CREATE TABLE IF NOT EXISTS gifts (
+                code TEXT PRIMARY KEY, amount INTEGER, capacity INTEGER, created_at INTEGER
+            )""")
+            await c.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                payment_id TEXT PRIMARY KEY, user_id TEXT, plan TEXT,
+                amount INTEGER, price INTEGER, status TEXT DEFAULT 'pending',
+                order_code TEXT UNIQUE, created_at INTEGER
+            )""")
+            await c.execute("""
+            CREATE TABLE IF NOT EXISTS support (
+                msg_id TEXT PRIMARY KEY, user_id TEXT, name TEXT, msg TEXT,
+                status TEXT DEFAULT 'new', reply TEXT, created_at INTEGER
+            )""")
+            await c.execute("""
+            CREATE TABLE IF NOT EXISTS child_users (
+                user_id TEXT, bot_id TEXT, bot_type TEXT,
+                PRIMARY KEY (user_id, bot_id)
+            )""")
+            await db.commit()
+    finally:
+        await db.close()
+
+
+async def get_user(uid):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("""
+            SELECT uid, name, username, coins, invited_by, banned,
+                   daily_claimed, ref_code, used_gift_codes
+            FROM users WHERE uid=?""", (str(uid),))
+            row = await c.fetchone()
+    finally:
+        await db.close()
+    if not row:
+        return None
+    try:
+        used = json.loads(row[8] or "[]")
+    except Exception:
+        used = []
+    return {
+        "uid": row[0], "name": row[1], "username": row[2],
+        "coins": row[3], "invited_by": row[4], "banned": row[5],
+        "daily_claimed": row[6], "ref_code": row[7], "used_gift_codes": used
+    }
+
+
+async def get_user_by_ref(ref):
+    if not ref:
+        return None
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("SELECT uid FROM users WHERE ref_code=?", (ref,))
+            r = await c.fetchone()
+            return r[0] if r else None
+    finally:
+        await db.close()
+
+
+async def create_user(uid, name="کاربر", username="ندارد"):
+    ref_code = None
+    for _ in range(20):
+        code = generate_ref_code()
+        if not await get_user_by_ref(code):
+            ref_code = code
+            break
+    if not ref_code:
+        ref_code = generate_ref_code(12)
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("""
+            INSERT OR IGNORE INTO users (uid, name, username, coins, ref_code)
+            VALUES (?, ?, ?, 0, ?)""", (str(uid), name, username, ref_code))
+            await db.commit()
+    finally:
+        await db.close()
+    return await get_user(uid)
+
+
+async def update_user(uid, **kwargs):
+    if not kwargs:
+        return
+    fields, values = [], []
+    for k, v in kwargs.items():
+        if k == "used_gift_codes":
+            v = json.dumps(v or [])
+        fields.append(f"{k}=?")
+        values.append(v)
+    values.append(str(uid))
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute(f"UPDATE users SET {', '.join(fields)} WHERE uid=?", values)
+            await db.commit()
+    finally:
+        await db.close()
+
+
+async def add_coins(uid, amount):
+    if not amount:
+        return
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            if amount > 0:
+                await c.execute("UPDATE users SET coins=coins+? WHERE uid=?", (amount, str(uid)))
+            else:
+                await c.execute("UPDATE users SET coins=MAX(0,coins+?) WHERE uid=?", (amount, str(uid)))
+            await db.commit()
+    finally:
+        await db.close()
+
+
+async def spend_coins(uid, amount):
+    if amount <= 0:
+        return True
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute(
+                "UPDATE users SET coins=coins-? WHERE uid=? AND coins>=?",
+                (amount, str(uid), amount))
+            await db.commit()
+            return c.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def find_user(query):
+    if not query:
+        return None, []
+    q = query.strip()
+    ql = q.lower()
+    qn = ql.lstrip('@')
+    db = await db_connect()
+    rows = []
+    try:
+        async with db.cursor() as c:
+            for sql, param in [
+                ("SELECT uid FROM users WHERE uid=?", (q,)),
+                ("SELECT uid FROM users WHERE ref_code=?", (q.upper(),)),
+                ("SELECT uid FROM users WHERE LOWER(username) IN (?,?,?)", (ql, qn, f"@{qn}")),
+            ]:
+                await c.execute(sql, param)
+                r = await c.fetchone()
+                if r:
+                    return r[0], []
+            await c.execute("SELECT uid FROM users WHERE LOWER(name)=?", (ql,))
+            rows = await c.fetchall()
+            if len(rows) == 1:
+                return rows[0][0], []
+            if len(rows) > 1:
+                return None, [r[0] for r in rows]
+            await c.execute("SELECT uid FROM users WHERE LOWER(name) LIKE ?", (f"%{ql}%",))
+            rows = await c.fetchall()
+    finally:
+        await db.close()
+    if len(rows) == 1:
+        return rows[0][0], []
+    if len(rows) > 1:
+        return None, [r[0] for r in rows]
+    return None, []
+
+
+async def count_refs(uid):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("SELECT COUNT(*) FROM users WHERE invited_by=?", (str(uid),))
+            return (await c.fetchone())[0]
+    finally:
+        await db.close()
+
+
+async def count_users():
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("SELECT COUNT(*) FROM users")
+            return (await c.fetchone())[0]
+    finally:
+        await db.close()
+
+
+async def all_user_ids():
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("SELECT uid FROM users")
+            return [r[0] for r in await c.fetchall()]
+    finally:
+        await db.close()
+
+
+async def is_admin(uid):
+    uid = str(uid)
+    now = time.time()
+    cached = _maker_admin_cache.get(uid)
+    if cached and now - cached['t'] < _MAKER_ADMIN_CACHE_TTL:
+        return cached['v']
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("SELECT 1 FROM admins WHERE uid=?", (uid,))
+            r = await c.fetchone()
+    finally:
+        await db.close()
+    v = r is not None
+    _maker_admin_cache[uid] = {'v': v, 't': now}
+    return v
+
+
+async def add_admin(uid):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("INSERT OR IGNORE INTO admins (uid) VALUES (?)", (str(uid),))
+            await db.commit()
+        _maker_admin_cache.pop(str(uid), None)
+    finally:
+        await db.close()
+
+
+async def get_setting(key, default=None):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("SELECT value FROM settings WHERE key=?", (key,))
+            r = await c.fetchone()
+    finally:
+        await db.close()
+    if not r:
+        return default
+    try:
+        return json.loads(r[0])
+    except Exception:
+        return r[0]
+
+
+async def set_setting(key, value):
+    v = json.dumps(value) if isinstance(value, (dict, list)) else str(value)
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, v))
+            await db.commit()
+    finally:
+        await db.close()
+
+
+async def init_settings():
+    defaults = {
+        "card_number": "6219861902043842",
+        "card_holder": "بهره مند",
+        "daily_coins": 50,
+        "admin_pass": MAKER_ADMIN_PASS,
+        "chat_cost": 10,
+        "group_cost": 15,
+        "war_cost": 20,
+        "coin_prices": {"10": 5000, "20": 10000, "50": 25000},
+    }
+    for k, v in defaults.items():
+        if await get_setting(k) is None:
+            await set_setting(k, v)
+
+
+async def save_bot(bot_id, owner, token, password, btype):
+    if not password or len(password.strip()) < 3:
+        raise ValueError("رمز حداقل ۳ کاراکتر")
+    p = password.strip()
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("""
+            INSERT OR REPLACE INTO bots
+            (bot_id, owner_id, token, password, plain_password, bot_type, is_active, created_at)
+            VALUES (?,?,?,?,?,?,1,?)""",
+                (bot_id, str(owner), token, hash_password(p), p, btype, int(time.time())))
+            await db.commit()
+    finally:
+        await db.close()
+
+
+async def get_bot(bot_id, owner=None):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            if owner:
+                await c.execute("""SELECT bot_id,owner_id,token,bot_type,is_active,plain_password
+                    FROM bots WHERE bot_id=? AND owner_id=?""", (bot_id, str(owner)))
+            else:
+                await c.execute("""SELECT bot_id,owner_id,token,bot_type,is_active,plain_password
+                    FROM bots WHERE bot_id=?""", (bot_id,))
+            r = await c.fetchone()
+    finally:
+        await db.close()
+    if not r:
+        return None
+    return {"bot_id": r[0], "owner_id": r[1], "token": r[2],
+            "bot_type": r[3], "is_active": r[4], "plain_password": r[5]}
+
+
+async def is_owner(bot_id, owner):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("SELECT 1 FROM bots WHERE bot_id=? AND owner_id=?",
+                            (bot_id, str(owner)))
+            return (await c.fetchone()) is not None
+    finally:
+        await db.close()
+
+
+async def user_bots(owner):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("""SELECT bot_id, bot_type, is_active FROM bots WHERE owner_id=?""",
+                            (str(owner),))
+            return await c.fetchall()
+    finally:
+        await db.close()
+
+
+async def delete_bot(bot_id, owner=None):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            if owner:
+                await c.execute("DELETE FROM bots WHERE bot_id=? AND owner_id=?",
+                                (bot_id, str(owner)))
+            else:
+                await c.execute("DELETE FROM bots WHERE bot_id=?", (bot_id,))
+            await c.execute("DELETE FROM child_users WHERE bot_id=?", (bot_id,))
+            await db.commit()
+    finally:
+        await db.close()
+
+
+async def toggle_bot(bot_id, active, owner=None):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            if owner:
+                await c.execute("UPDATE bots SET is_active=? WHERE bot_id=? AND owner_id=?",
+                                (1 if active else 0, bot_id, str(owner)))
+            else:
+                await c.execute("UPDATE bots SET is_active=? WHERE bot_id=?",
+                                (1 if active else 0, bot_id))
+            await db.commit()
+    finally:
+        await db.close()
+
+
+async def update_bot_pwd(bot_id, owner, new_pwd):
+    if not new_pwd or len(new_pwd.strip()) < 3:
+        return False
+    p = new_pwd.strip()
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("UPDATE bots SET password=?, plain_password=? WHERE bot_id=? AND owner_id=?",
+                            (hash_password(p), p, bot_id, str(owner)))
+            await db.commit()
+            return c.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def track_child_user(user_id, bot_id, btype):
+    key = f"{user_id}_{bot_id}"
+    if key in _processed_child_users:
+        return
+    try:
+        db = await db_connect()
+        try:
+            async with db.cursor() as c:
+                await c.execute("INSERT OR IGNORE INTO child_users VALUES (?,?,?)",
+                                (str(user_id), bot_id, btype))
+                await db.commit()
+            _processed_child_users.add(key)
+        finally:
+            await db.close()
+    except Exception:
+        pass
+
+
+async def create_gift(code, amount, capacity):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("INSERT OR REPLACE INTO gifts VALUES (?,?,?,?)",
+                            (code.strip(), amount, capacity, int(time.time())))
+            await db.commit()
+            return True
+    except Exception:
+        return False
+    finally:
+        await db.close()
+
+
+async def get_gift(code):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("SELECT code, amount, capacity FROM gifts WHERE code=?",
+                            (code.strip(),))
+            r = await c.fetchone()
+    finally:
+        await db.close()
+    return {"code": r[0], "amount": r[1], "capacity": r[2]} if r else None
+
+
+async def use_gift(code):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("UPDATE gifts SET capacity=capacity-1 WHERE code=? AND capacity>0",
+                            (code.strip(),))
+            await db.commit()
+            return c.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def list_gifts():
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("SELECT code, amount, capacity FROM gifts")
+            return await c.fetchall()
+    finally:
+        await db.close()
+
+
+async def create_payment(uid, plan, amount, price, code):
+    pid = f"pay_{uuid.uuid4().hex[:8]}"
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("""INSERT INTO payments
+                (payment_id, user_id, plan, amount, price, status, order_code, created_at)
+                VALUES (?,?,?,?,?,'pending',?,?)""",
+                (pid, str(uid), plan, amount, price, code, int(time.time())))
+            await db.commit()
+    finally:
+        await db.close()
+    return pid
+
+
+async def get_payment_by_code(code):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("""SELECT payment_id, user_id, plan, amount, price
+                FROM payments WHERE order_code=? AND status='pending'""", (code,))
+            return await c.fetchone()
+    finally:
+        await db.close()
+
+
+async def confirm_payment(pid):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("UPDATE payments SET status='confirmed' WHERE payment_id=?", (pid,))
+            await db.commit()
+    finally:
+        await db.close()
+
+
+async def reject_payment(pid):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("UPDATE payments SET status='rejected' WHERE payment_id=?", (pid,))
+            await db.commit()
+    finally:
+        await db.close()
+
+
+async def list_pending_payments():
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("""SELECT payment_id,user_id,plan,amount,price,order_code
+                FROM payments WHERE status='pending' ORDER BY created_at DESC""")
+            return await c.fetchall()
+    finally:
+        await db.close()
+
+
+async def create_support(uid, name, msg):
+    mid = uuid.uuid4().hex[:12]
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("""INSERT INTO support (msg_id,user_id,name,msg,status,created_at)
+                VALUES (?,?,?,?,'new',?)""",
+                (mid, str(uid), name or "کاربر", msg, int(time.time())))
+            await db.commit()
+    finally:
+        await db.close()
+    return mid
+
+
+async def list_support_new():
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("SELECT msg_id,user_id,name,msg FROM support WHERE status='new'")
+            return await c.fetchall()
+    finally:
+        await db.close()
+
+
+async def reply_support(mid, reply):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("UPDATE support SET status='replied', reply=? WHERE msg_id=?",
+                            (reply, mid))
+            await db.commit()
+    finally:
+        await db.close()
+
+
+async def get_support(mid):
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("SELECT msg_id,user_id,name,msg FROM support WHERE msg_id=?", (mid,))
+            return await c.fetchone()
+    finally:
+        await db.close()
+
+
+async def all_admins():
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("SELECT uid FROM admins")
+            return [r[0] for r in await c.fetchall()]
+    finally:
+        await db.close()
+
+
+async def stop_child(owner, bot_id):
+    ok = str(owner)
+    if ok in child_tasks and bot_id in child_tasks[ok]:
+        task = child_tasks[ok][bot_id]
+        if not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+        del child_tasks[ok][bot_id]
+        if not child_tasks[ok]:
+            del child_tasks[ok]
+    await toggle_bot(bot_id, False)
+
+
+async def start_child(owner, bot_id, token, pwd, btype):
+    ok = str(owner)
+    existing = child_tasks.get(ok, {}).get(bot_id)
+    if existing and not existing.done():
+        return existing
+    if ok in child_tasks and bot_id in child_tasks[ok]:
+        del child_tasks[ok][bot_id]
+
+    if btype == "anonymous":
+        task = asyncio.create_task(run_anonymous(owner, bot_id, token, pwd))
+    elif btype == "group":
+        task = asyncio.create_task(run_group(owner, bot_id, token, pwd))
+    elif btype == "war":
+        task = asyncio.create_task(run_war(owner, bot_id, token, pwd))
+    else:
+        return None
+
+    child_tasks.setdefault(ok, {})[bot_id] = task
+
+    def cleanup(t, okk=ok, bid=bot_id):
+        if okk in child_tasks and bid in child_tasks[okk]:
+            del child_tasks[okk][bid]
+            if not child_tasks[okk]:
+                del child_tasks[okk]
+
+    task.add_done_callback(cleanup)
+    await toggle_bot(bot_id, True)
+    return task
+
+
+async def remove_child(owner, bot_id):
+    await stop_child(owner, bot_id)
+    await delete_bot(bot_id, owner=owner)
+    for sub in (f"anon_{bot_id}", f"group_{bot_id}", f"war_{bot_id}"):
+        p = os.path.join(DATA_DIR, sub)
+        if os.path.exists(p):
+            try:
+                shutil.rmtree(p)
+            except Exception:
+                pass
+
+
+anon_wait = {}
+anon_active = {}
+anon_group = {}
+
+
+async def run_anonymous(owner, bot_id, token, admin_password):
+    retry = 0
+    while retry < 10:
+        try:
+            bot = Bot(token)
+            bdir = os.path.join(DATA_DIR, f"anon_{bot_id}")
+            os.makedirs(bdir, exist_ok=True)
+            dbpath = os.path.join(bdir, "data.db")
+
+            async def conn():
+                return await aiosqlite.connect(dbpath)
+
+            db = await conn()
+            try:
+                async with db.cursor() as c:
+                    await c.execute("PRAGMA journal_mode=WAL;")
+                    await c.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        uid TEXT PRIMARY KEY, name TEXT, username TEXT,
+                        coins INTEGER DEFAULT 0, chats INTEGER DEFAULT 0,
+                        step TEXT, daily TEXT, used TEXT DEFAULT '[]',
+                        target TEXT, temp TEXT, banned INTEGER DEFAULT 0
+                    )""")
+                    await c.execute("CREATE TABLE IF NOT EXISTS admins (uid TEXT PRIMARY KEY)")
+                    await c.execute("CREATE TABLE IF NOT EXISTS gifts (code TEXT PRIMARY KEY, amount INTEGER, capacity INTEGER)")
+                    await c.execute("""CREATE TABLE IF NOT EXISTS pays (
+                        pid TEXT PRIMARY KEY, uid TEXT, plan TEXT, amount INTEGER,
+                        price INTEGER, status TEXT DEFAULT 'pending',
+                        code TEXT UNIQUE, created INTEGER)""")
+                    await c.execute("""CREATE TABLE IF NOT EXISTS support (
+                        mid TEXT PRIMARY KEY, uid TEXT, name TEXT, msg TEXT,
+                        status TEXT DEFAULT 'new', created INTEGER)""")
+                    await c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+                    await c.execute("CREATE TABLE IF NOT EXISTS msgs (msg_id TEXT PRIMARY KEY, uid TEXT)")
+                    await db.commit()
+            finally:
+                await db.close()
+
+            async def get_u(uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("""SELECT uid,name,coins,chats,step,daily,used,target,temp,banned
+                            FROM users WHERE uid=?""", (str(uid),))
+                        r = await c.fetchone()
+                finally:
+                    await db.close()
+                if not r:
+                    return None
+                try:
+                    used = json.loads(r[6] or "[]")
+                except Exception:
+                    used = []
+                try:
+                    temp = json.loads(r[8]) if r[8] else None
+                except Exception:
+                    temp = None
+                return {"uid": r[0], "name": r[1], "coins": r[2], "chats": r[3],
+                        "step": r[4], "daily": r[5], "used": used, "target": r[7],
+                        "temp": temp, "banned": r[9]}
+
+            async def create_u(uid, name):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("INSERT OR IGNORE INTO users (uid,name,step) VALUES (?,?,'adult')",
+                                        (str(uid), name))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def upd_u(uid, **kw):
+                if not kw:
+                    return
+                f, v = [], []
+                for k, val in kw.items():
+                    if k in ("used", "temp"):
+                        val = json.dumps(val) if val is not None else None
+                    f.append(f"{k}=?")
+                    v.append(val)
+                v.append(str(uid))
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute(f"UPDATE users SET {', '.join(f)} WHERE uid=?", v)
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def add_c(uid, amount):
+                if not amount:
+                    return
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        if amount > 0:
+                            await c.execute("UPDATE users SET coins=coins+? WHERE uid=?", (amount, str(uid)))
+                        else:
+                            await c.execute("UPDATE users SET coins=MAX(0,coins+?) WHERE uid=?", (amount, str(uid)))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def spend_c(uid, amount):
+                if amount <= 0:
+                    return True
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("UPDATE users SET coins=coins-? WHERE uid=? AND coins>=?",
+                                        (amount, str(uid), amount))
+                        await db.commit()
+                        return c.rowcount > 0
+                finally:
+                    await db.close()
+
+            async def is_adm(uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT 1 FROM admins WHERE uid=?", (str(uid),))
+                        return (await c.fetchone()) is not None
+                finally:
+                    await db.close()
+
+            async def add_adm(uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("INSERT OR IGNORE INTO admins (uid) VALUES (?)", (str(uid),))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def all_adms():
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT uid FROM admins")
+                        return [r[0] for r in await c.fetchall()]
+                finally:
+                    await db.close()
+
+            async def get_set(k, d=None):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT value FROM settings WHERE key=?", (k,))
+                        r = await c.fetchone()
+                finally:
+                    await db.close()
+                if not r:
+                    return d
+                try:
+                    return json.loads(r[0])
+                except Exception:
+                    return r[0]
+
+            async def set_set(k, v):
+                vs = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (k, vs))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def find_u(q):
+                if not q:
+                    return None, []
+                q = q.strip()
+                ql = q.lower()
+                qn = ql.lstrip('@')
+                db = await conn()
+                rows = []
+                try:
+                    async with db.cursor() as c:
+                        for sql, p in [
+                            ("SELECT uid FROM users WHERE uid=?", (q,)),
+                            ("SELECT uid FROM users WHERE LOWER(username) IN (?,?,?)", (ql, qn, f"@{qn}")),
+                            ("SELECT uid FROM users WHERE LOWER(name)=?", (ql,)),
+                        ]:
+                            await c.execute(sql, p)
+                            r = await c.fetchone()
+                            if r:
+                                return r[0], []
+                        await c.execute("SELECT uid FROM users WHERE LOWER(name) LIKE ?", (f"%{ql}%",))
+                        rows = await c.fetchall()
+                finally:
+                    await db.close()
+                if len(rows) == 1:
+                    return rows[0][0], []
+                if len(rows) > 1:
+                    return None, [r[0] for r in rows]
+                return None, []
+
+            async def top_users():
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT name,coins FROM users ORDER BY coins DESC LIMIT 10")
+                        return await c.fetchall()
+                finally:
+                    await db.close()
+
+            async def cnt_users():
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT COUNT(*) FROM users")
+                        return (await c.fetchone())[0]
+                finally:
+                    await db.close()
+
+            async def list_uids():
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT uid FROM users")
+                        return [r[0] for r in await c.fetchall()]
+                finally:
+                    await db.close()
+
+            for k, v in {
+                "admin_pass": admin_password,
+                "daily_coins": 50,
+                "chat_cost": 3,
+                "group_cost": 5,
+                "card_number": await get_setting("card_number", "6219861902043842"),
+                "card_holder": await get_setting("card_holder", "بهره مند"),
+                "coin_prices": {"10": 5000, "20": 10000, "50": 25000},
+            }.items():
+                if await get_set(k) is None:
+                    await set_set(k, v)
+
+            main_kb = make_keypad([
+                ["💬 چت ناشناس", "👥 چت گروهی"],
+                ["💰 سکه روزانه", "📊 موجودی"],
+                ["💳 خرید سکه", "💸 انتقال"],
+                ["🏆 کاربران برتر", "🎁 کد هدیه"],
+                ["📞 پشتیبانی"],
+            ])
+            search_kb = make_keypad([["❌ لغو جستجو"]])
+            chat_kb = make_keypad([["❌ پایان چت"]])
+            group_kb = make_keypad([["🚪 خروج از گروه"]])
+            cancel_kb_local = make_keypad([["❌ لغو"]])
+            adult_kb = make_keypad([["✅ بالای 18 ساله"], ["❌ زیر 18 ساله"]])
+            rules_kb = make_keypad([["✅ تایید می‌کنم"], ["❌ انصراف می‌دهم"]])
+            admin_kb = make_keypad([
+                ["📈 آمار کاربران"],
+                ["➕ افزایش سکه", "🔄 صفر کردن سکه"],
+                ["🎁 ایجاد کد هدیه"],
+                ["📢 پیام همگانی"],
+                ["🚫 بن کاربر", "✅ آنبن کاربر"],
+                ["📨 پشتیبانی"],
+                ["⚙️ سکه روزانه"],
+                ["💰 تنظیم قیمت سکه"],
+                ["🔐 تغییر رمز"],
+                ["🔙 خروج از پنل"],
+            ])
+            support_admin_kb = make_keypad([
+                ["📨 مشاهده پیام‌ها"],
+                ["📤 پاسخ به کاربر"],
+                ["🔙 بازگشت"],
+            ])
+
+            def buy_kb(prices):
+                rows = []
+                try:
+                    items = sorted(prices.items(), key=lambda x: int(x[0]))
+                except Exception:
+                    items = list(prices.items())
+                for am, pr in items:
+                    rows.append([f"💎 {am} سکه | {int(pr):,}T"])
+                rows.append(["🔙 بازگشت"])
+                return make_keypad(rows)
+
+            @bot.on_new_message()
+            async def anon_handler(bot, event):
+                try:
+                    chat_id = str(event.chat_id)
+                    raw = event.text or ""
+                    txt = resolve_button(raw)
+
+                    if not is_private_chat(chat_id):
+                        return
+
+                    await track_child_user(chat_id, bot_id, "anonymous")
+
+                    u = await get_u(chat_id)
+                    if not u:
+                        name = "کاربر"
+                        try:
+                            info = await bot.get_chat_info(chat_id)
+                            if info and hasattr(info, "data") and hasattr(info.data, "chat"):
+                                name = getattr(info.data.chat, "first_name", None) or name
+                        except Exception:
+                            pass
+                        await create_u(chat_id, name)
+                        u = await get_u(chat_id)
+                        if not u:
+                            return
+
+                    if u["banned"]:
+                        await safe_send(bot, chat_id, "🚫 شما بن شده‌اید.")
+                        return
+
+                    if raw.startswith("/start"):
+                        await upd_u(chat_id, step="adult")
+                        await safe_send(bot, chat_id,
+                            f"👋 خوش آمدید {u['name']}!\n\n⚠️ قوانین:\n"
+                            f"1️⃣ فقط بالای 18 سال\n2️⃣ عدم محتوای نامناسب\n"
+                            f"3️⃣ عدم لینک تبلیغاتی\n4️⃣ رعایت احترام\n\n"
+                            f"📝 تایید کنید:", keypad=adult_kb)
+                        return
+
+                    step = u.get("step")
+
+                    if step == "adult":
+                        norm = normalize_text(raw).replace("‌", "").replace(" ", "")
+                        if "بالای18" in norm:
+                            await upd_u(chat_id, step="rules")
+                            await safe_send(bot, chat_id, "📜 تایید قوانین:", keypad=rules_kb)
+                        elif "زیر18" in norm:
+                            await safe_send(bot, chat_id, "🚫 فقط بالای 18 سال.")
+                        else:
+                            await safe_send(bot, chat_id, "⚠️ از دکمه‌ها استفاده کن.", keypad=adult_kb)
+                        return
+
+                    if step == "rules":
+                        norm = normalize_text(raw).replace("‌", "").replace(" ", "").replace("✅", "")
+                        if "تایید" in norm or "تأیید" in norm:
+                            await upd_u(chat_id, step=None)
+                            await safe_send(bot, chat_id, "✅ ثبت‌نام کامل شد!", keypad=main_kb)
+                        elif "انصراف" in norm:
+                            await upd_u(chat_id, step=None)
+                            await safe_send(bot, chat_id, "❌ انصراف داده شد. /start را بفرست.")
+                        else:
+                            await safe_send(bot, chat_id, "⚠️ از دکمه‌ها استفاده کن.", keypad=rules_kb)
+                        return
+
+                    if step == "gift":
+                        code = txt.strip()
+                        if code in u["used"]:
+                            await safe_send(bot, chat_id, "⚠️ قبلاً استفاده کردی.")
+                            await upd_u(chat_id, step=None)
+                            return
+                        db = await conn()
+                        try:
+                            async with db.cursor() as c:
+                                await c.execute("SELECT amount, capacity FROM gifts WHERE code=?", (code,))
+                                g = await c.fetchone()
+                                if g and g[1] > 0:
+                                    await c.execute("UPDATE gifts SET capacity=capacity-1 WHERE code=?", (code,))
+                                    await db.commit()
+                                    used = u["used"] + [code]
+                                    await upd_u(chat_id, used=used, step=None)
+                                    await add_c(chat_id, g[0])
+                                    fresh = await get_u(chat_id)
+                                    await safe_send(bot, chat_id,
+                                        f"✅ {g[0]} سکه اضافه شد.\n💰 {fresh['coins']}",
+                                        keypad=main_kb)
+                                else:
+                                    await safe_send(bot, chat_id, "❌ کد نامعتبر یا تمام شده.")
+                        finally:
+                            await db.close()
+                        return
+
+                    if step == "trg":
+                        target, matches = await find_u(txt)
+                        if not target:
+                            if matches:
+                                out = f"⚠️ {len(matches)} کاربر:\n\n"
+                                for m in matches[:10]:
+                                    uu = await get_u(m)
+                                    if uu:
+                                        out += f"📛 {uu['name']}\n🔢 {m}\n\n"
+                                await safe_send(bot, chat_id, out)
+                            else:
+                                await safe_send(bot, chat_id, "❌ پیدا نشد.")
+                            return
+                        if target == chat_id:
+                            await safe_send(bot, chat_id, "❌ به خودت نمی‌تونی.")
+                            return
+                        await upd_u(chat_id, target=target, step="tram")
+                        await safe_send(bot, chat_id, "💰 مقدار سکه:", keypad=cancel_kb_local)
+                        return
+
+                    if step == "tram":
+                        if not txt.isdigit() or int(txt) <= 0:
+                            await safe_send(bot, chat_id, "❌ عدد مثبت.")
+                            return
+                        am = int(txt)
+                        if not await spend_c(chat_id, am):
+                            await safe_send(bot, chat_id, "❌ سکه کافی نیست.")
+                            return
+                        await add_c(u["target"], am)
+                        await upd_u(chat_id, step=None, target=None)
+                        fresh = await get_u(chat_id)
+                        tgt = await get_u(u["target"])
+                        await safe_send(bot, chat_id,
+                            f"✅ {am} سکه به {tgt['name'] if tgt else '?'} انتقال یافت.\n"
+                            f"💰 {fresh['coins']}", keypad=main_kb)
+                        try:
+                            await bot.send_message(u["target"],
+                                f"💰 {am} سکه از {u['name']}!", chat_keypad=main_kb)
+                        except Exception:
+                            pass
+                        return
+
+                    if step == "sup":
+                        if contains_bad_word(txt) or contains_link(txt):
+                            await safe_send(bot, chat_id, "❌ پیام نامناسب.")
+                            return
+                        mid = uuid.uuid4().hex[:12]
+                        db = await conn()
+                        try:
+                            async with db.cursor() as c:
+                                await c.execute("""INSERT INTO support (mid,uid,name,msg,status,created)
+                                    VALUES (?,?,?,?,'new',?)""",
+                                    (mid, chat_id, u["name"], txt, int(time.time())))
+                                await db.commit()
+                        finally:
+                            await db.close()
+                        await upd_u(chat_id, step=None)
+                        await safe_send(bot, chat_id, f"✅ ارسال شد.\n🔑 {mid[:8]}", keypad=main_kb)
+                        for a in await all_adms():
+                            try:
+                                await bot.send_message(a,
+                                    f"📨 پشتیبانی\n👤 {u['name']}\n📝 {txt}\n🔑 {mid[:8]}")
+                            except Exception:
+                                pass
+                        return
+
+                    if step == "buy":
+                        m = re.search(r'(\d+)\s*سکه', raw) or re.search(r'buy_(\d+)', txt)
+                        if m:
+                            am = m.group(1)
+                            prices = await get_set("coin_prices", {})
+                            if am not in prices:
+                                await safe_send(bot, chat_id, "❌ نامعتبر.")
+                                return
+                            pr = prices[am]
+                            await upd_u(chat_id,
+                                temp={"plan": f"💎 {am} سکه", "amount": int(am), "price": int(pr)},
+                                step="pwait")
+                            cn = await get_set("card_number", "")
+                            ch = await get_set("card_holder", "")
+                            await safe_send(bot, chat_id,
+                                f"💳 خرید {am} سکه - {int(pr):,}\n\n💳 کارت:\n{cn}\n\n👤 {ch}\n\n"
+                                f"پس از واریز پرداخت کردم رو بزن.",
+                                keypad=payment_kb())
+                        else:
+                            await safe_send(bot, chat_id, "❌ پکیج نامعتبر.", keypad=cancel_kb_local)
+                        return
+
+                    if step == "pwait":
+                        if txt == "✅ پرداخت کردم":
+                            tp = u["temp"] or {}
+                            code = generate_order_code()
+                            db = await conn()
+                            try:
+                                async with db.cursor() as c:
+                                    await c.execute("""INSERT INTO pays
+                                        (pid,uid,plan,amount,price,status,code,created)
+                                        VALUES (?,?,?,?,?,'pending',?,?)""",
+                                        (uuid.uuid4().hex[:12], chat_id, tp.get("plan", ""),
+                                         tp.get("amount", 0), tp.get("price", 0), code, int(time.time())))
+                                    await db.commit()
+                            finally:
+                                await db.close()
+                            await upd_u(chat_id, step=None, temp=None)
+                            await safe_send(bot, chat_id,
+                                f"🌟 درخواست ثبت شد.\n🔑 {code}", keypad=main_kb)
+                            for a in await all_adms():
+                                try:
+                                    await bot.send_message(a, f"📩 خرید جدید\n👤 {u['name']}\n🔑 {code}")
+                                except Exception:
+                                    pass
+                        return
+
+                    if step == "a_add_id":
+                        t, _ = await find_u(txt)
+                        if t:
+                            await upd_u(chat_id, target=t, step="a_add_am")
+                            await safe_send(bot, chat_id, "💰 مقدار:", keypad=cancel_kb_local)
+                        else:
+                            await safe_send(bot, chat_id, "❌ پیدا نشد.")
+                        return
+                    if step == "a_add_am":
+                        if not txt.isdigit():
+                            await safe_send(bot, chat_id, "❌ عدد.")
+                            return
+                        await add_c(u["target"], int(txt))
+                        await upd_u(chat_id, step=None, target=None)
+                        await safe_send(bot, chat_id, f"✅ {txt} سکه اضافه شد.", keypad=admin_kb)
+                        return
+                    if step == "a_reset":
+                        t, _ = await find_u(txt)
+                        if t:
+                            db = await conn()
+                            try:
+                                async with db.cursor() as c:
+                                    await c.execute("UPDATE users SET coins=0 WHERE uid=?", (t,))
+                                    await db.commit()
+                            finally:
+                                await db.close()
+                            await safe_send(bot, chat_id, "✅ صفر شد.", keypad=admin_kb)
+                        await upd_u(chat_id, step=None)
+                        return
+                    if step == "a_g_am":
+                        if not txt.isdigit():
+                            await safe_send(bot, chat_id, "❌ عدد.")
+                            return
+                        await upd_u(chat_id, temp={"g_am": int(txt)}, step="a_g_cap")
+                        await safe_send(bot, chat_id, "🔢 ظرفیت:", keypad=cancel_kb_local)
+                        return
+                    if step == "a_g_cap":
+                        if not txt.isdigit():
+                            await safe_send(bot, chat_id, "❌ عدد.")
+                            return
+                        tp = u["temp"] or {}
+                        tp["g_cap"] = int(txt)
+                        await upd_u(chat_id, temp=tp, step="a_g_code")
+                        await safe_send(bot, chat_id, "🔑 کد:", keypad=cancel_kb_local)
+                        return
+                    if step == "a_g_code":
+                        tp = u["temp"] or {}
+                        db = await conn()
+                        try:
+                            async with db.cursor() as c:
+                                await c.execute("INSERT OR REPLACE INTO gifts VALUES (?,?,?)",
+                                                (txt.strip(), tp.get("g_am", 10), tp.get("g_cap", 10)))
+                                await db.commit()
+                        finally:
+                            await db.close()
+                        await upd_u(chat_id, step=None, temp=None)
+                        await safe_send(bot, chat_id, f"✅ کد {txt} ساخته شد.", keypad=admin_kb)
+                        return
+                    if step == "a_bc":
+                        uids = await list_uids()
+                        ok = 0
+                        for uid2 in uids:
+                            try:
+                                await bot.send_message(uid2, f"📢 پیام مدیریت:\n\n{txt}")
+                                ok += 1
+                                await asyncio.sleep(0.05)
+                            except Exception:
+                                pass
+                        await upd_u(chat_id, step=None)
+                        await safe_send(bot, chat_id, f"✅ {ok}/{len(uids)}", keypad=admin_kb)
+                        return
+                    if step == "a_ban":
+                        t, _ = await find_u(txt)
+                        if t:
+                            db = await conn()
+                            try:
+                                async with db.cursor() as c:
+                                    await c.execute("UPDATE users SET banned=1 WHERE uid=?", (t,))
+                                    await db.commit()
+                            finally:
+                                await db.close()
+                            await safe_send(bot, chat_id, f"✅ {t} بن شد.", keypad=admin_kb)
+                        await upd_u(chat_id, step=None)
+                        return
+                    if step == "a_unban":
+                        t, _ = await find_u(txt)
+                        if t:
+                            db = await conn()
+                            try:
+                                async with db.cursor() as c:
+                                    await c.execute("UPDATE users SET banned=0 WHERE uid=?", (t,))
+                                    await db.commit()
+                            finally:
+                                await db.close()
+                            await safe_send(bot, chat_id, f"✅ {t} آنبن شد.", keypad=admin_kb)
+                        await upd_u(chat_id, step=None)
+                        return
+                    if step == "a_daily":
+                        if txt.isdigit():
+                            await set_set("daily_coins", int(txt))
+                            await safe_send(bot, chat_id, f"✅ {txt}", keypad=admin_kb)
+                        await upd_u(chat_id, step=None)
+                        return
+                    if step == "a_prices":
+                        try:
+                            np = {}
+                            for part in txt.split("|"):
+                                a, p = part.split(":")
+                                np[a.strip()] = int(p.strip())
+                            await set_set("coin_prices", np)
+                            await safe_send(bot, chat_id, "✅ آپدیت شد.", keypad=admin_kb)
+                        except Exception:
+                            await safe_send(bot, chat_id, "❌ فرمت اشتباه.")
+                        await upd_u(chat_id, step=None)
+                        return
+                    if step == "a_card":
+                        await set_set("card_number", txt.strip())
+                        await upd_u(chat_id, step="a_card_h")
+                        await safe_send(bot, chat_id, "👤 نام صاحب کارت:", keypad=cancel_kb_local)
+                        return
+                    if step == "a_card_h":
+                        await set_set("card_holder", txt.strip())
+                        await upd_u(chat_id, step=None)
+                        await safe_send(bot, chat_id, "✅ ذخیره شد.", keypad=admin_kb)
+                        return
+                    if step == "a_pass":
+                        if len(txt) < 3:
+                            await safe_send(bot, chat_id, "❌ حداقل ۳ کاراکتر.")
+                            return
+                        await set_set("admin_pass", txt.strip())
+                        await upd_u(chat_id, step=None)
+                        await safe_send(bot, chat_id, "✅ رمز تغییر کرد.", keypad=main_kb)
+                        return
+                    if step == "a_reply_id":
+                        db = await conn()
+                        row = None
+                        try:
+                            async with db.cursor() as c:
+                                await c.execute("SELECT mid FROM support WHERE mid LIKE ?", (f"{txt}%",))
+                                row = await c.fetchone()
+                        finally:
+                            await db.close()
+                        if row:
+                            await upd_u(chat_id, target=row[0], step="a_reply_msg")
+                            await safe_send(bot, chat_id, "✍️ متن پاسخ:", keypad=cancel_kb_local)
+                        else:
+                            await safe_send(bot, chat_id, "❌ پیدا نشد.")
+                        return
+                    if step == "a_reply_msg":
+                        db = await conn()
+                        row = None
+                        try:
+                            async with db.cursor() as c:
+                                await c.execute("SELECT uid FROM support WHERE mid=?", (u["target"],))
+                                row = await c.fetchone()
+                        finally:
+                            await db.close()
+                        if row:
+                            try:
+                                await bot.send_message(row[0], f"📞 پاسخ:\n\n{txt}", chat_keypad=main_kb)
+                                await safe_send(bot, chat_id, "✅ ارسال شد.", keypad=support_admin_kb)
+                            except Exception as e:
+                                await safe_send(bot, chat_id, f"❌ {e}")
+                        await upd_u(chat_id, step=None, target=None)
+                        return
+
+                    if txt in ("💬 چت ناشناس", "👥 چت گروهی", "💰 سکه روزانه", "💰 دریافت سکه روزانه",
+                               "📊 موجودی من", "💳 خرید سکه", "💸 انتقال سکه", "🏆 کاربران برتر",
+                               "🎁 کد هدیه", "🎁 وارد کردن کد هدیه", "📞 پشتیبانی"):
+                        await upd_u(chat_id, step=None)
+
+                        if txt == "📊 موجودی من":
+                            fresh = await get_u(chat_id)
+                            await safe_send(bot, chat_id,
+                                f"📊 پروفایل شما\n\n👤 {fresh['name']}\n"
+                                f"💰 {fresh['coins']} سکه\n💬 {fresh['chats']} چت",
+                                keypad=main_kb)
+                            return
+
+                        if txt in ("💰 سکه روزانه", "💰 دریافت سکه روزانه"):
+                            today = str(datetime.date.today())
+                            if u["daily"] == today:
+                                await safe_send(bot, chat_id, "⚠️ امروز گرفتی.")
+                                return
+                            am = await get_set("daily_coins", 50)
+                            await add_c(chat_id, int(am))
+                            await upd_u(chat_id, daily=today)
+                            fresh = await get_u(chat_id)
+                            await safe_send(bot, chat_id,
+                                f"✅ {am} سکه اضافه شد.\n💰 {fresh['coins']}", keypad=main_kb)
+                            return
+
+                        if txt in ("🎁 کد هدیه", "🎁 وارد کردن کد هدیه"):
+                            await upd_u(chat_id, step="gift")
+                            await safe_send(bot, chat_id, "🔑 کد هدیه:", keypad=cancel_kb_local)
+                            return
+
+                        if txt == "💸 انتقال سکه":
+                            await upd_u(chat_id, step="trg")
+                            await safe_send(bot, chat_id, "💸 آیدی یا نام:", keypad=cancel_kb_local)
+                            return
+
+                        if txt == "🏆 کاربران برتر":
+                            tops = await top_users()
+                            out = "🏆 کاربران برتر\n\n"
+                            medals = ["🥇", "🥈", "🥉"]
+                            for i, (nm, co) in enumerate(tops):
+                                md = medals[i] if i < 3 else f"{i+1}."
+                                out += f"{md} {nm} - {co} سکه\n"
+                            await safe_send(bot, chat_id, out, keypad=main_kb)
+                            return
+
+                        if txt == "📞 پشتیبانی":
+                            await upd_u(chat_id, step="sup")
+                            await safe_send(bot, chat_id, "📝 پیام:", keypad=cancel_kb_local)
+                            return
+
+                        if txt == "💳 خرید سکه":
+                            await upd_u(chat_id, step="buy")
+                            prices = await get_set("coin_prices", {})
+                            await safe_send(bot, chat_id, "💳 پکیج:", keypad=buy_kb(prices))
+                            return
+
+                        if txt == "💬 چت ناشناس":
+                            cost = await get_set("chat_cost", 3)
+                            if u["coins"] < cost:
+                                await safe_send(bot, chat_id, f"❌ سکه کم. نیاز: {cost}")
+                                return
+                            anon_wait.setdefault(bot_id, [])
+                            anon_active.setdefault(bot_id, {})
+                            wait = anon_wait[bot_id]
+                            act = anon_active[bot_id]
+                            if chat_id in act:
+                                await safe_send(bot, chat_id, "ℹ️ در چت هستی.", keypad=chat_kb)
+                                return
+                            partner = None
+                            for w in list(wait):
+                                if w != chat_id:
+                                    partner = w
+                                    wait.remove(w)
+                                    break
+                            if partner:
+                                if not await spend_c(chat_id, cost):
+                                    await safe_send(bot, chat_id, "❌ سکه کم.")
+                                    if partner:
+                                        wait.append(partner)
+                                    return
+                                if not await spend_c(partner, cost):
+                                    await add_c(chat_id, cost)
+                                    wait.append(partner)
+                                    await safe_send(bot, chat_id, "❌ طرف مقابل سکه نداره.")
+                                    return
+                                act[chat_id] = partner
+                                act[partner] = chat_id
+                                await upd_u(chat_id, chats=u["chats"] + 1)
+                                pu = await get_u(partner)
+                                if pu:
+                                    await upd_u(partner, chats=pu["chats"] + 1)
+                                await safe_send(bot, chat_id,
+                                    f"✅ وصل شدی!\n👤 {pu['name'] if pu else '?'}\n💬 پیام بفرست.",
+                                    keypad=chat_kb)
+                                try:
+                                    await bot.send_message(partner,
+                                        f"✅ وصل شدی!\n👤 {u['name']}", chat_keypad=chat_kb)
+                                except Exception:
+                                    pass
+                            else:
+                                if chat_id not in wait:
+                                    wait.append(chat_id)
+                                await safe_send(bot, chat_id, "⏳ جستجو...", keypad=search_kb)
+                            return
+
+                        if txt == "👥 چت گروهی":
+                            cost = await get_set("group_cost", 5)
+                            anon_group.setdefault(bot_id, [])
+                            grp = anon_group[bot_id]
+                            if len(grp) >= 20:
+                                await safe_send(bot, chat_id, "❌ پر است.")
+                                return
+                            if chat_id not in grp:
+                                if not await spend_c(chat_id, cost):
+                                    await safe_send(bot, chat_id, f"❌ سکه کم. نیاز: {cost}")
+                                    return
+                                grp.append(chat_id)
+                                await safe_send(bot, chat_id, "✅ وارد شدی.", keypad=group_kb)
+                                for uid2 in grp:
+                                    if uid2 != chat_id:
+                                        try:
+                                            await bot.send_message(uid2, f"👤 {u['name']} وارد گروه شد!")
+                                        except Exception:
+                                            pass
+                            else:
+                                await safe_send(bot, chat_id, "ℹ️ در گروه هستی.", keypad=group_kb)
+                            return
+
+                    if txt == "❌ لغو":
+                        await upd_u(chat_id, step=None)
+                        await safe_send(bot, chat_id, "✅ لغو شد.", keypad=main_kb)
+                        return
+
+                    if txt == "🔙 بازگشت":
+                        await upd_u(chat_id, step=None)
+                        await safe_send(bot, chat_id, "🔙 بازگشت.", keypad=main_kb)
+                        return
+
+                    if txt == "❌ لغو جستجو":
+                        if bot_id in anon_wait and chat_id in anon_wait[bot_id]:
+                            anon_wait[bot_id].remove(chat_id)
+                        await safe_send(bot, chat_id, "✅ لغو شد.", keypad=main_kb)
+                        return
+
+                    if txt == "❌ پایان چت":
+                        if bot_id in anon_active and chat_id in anon_active[bot_id]:
+                            p = anon_active[bot_id].pop(chat_id)
+                            anon_active[bot_id].pop(p, None)
+                            await safe_send(bot, chat_id, "❌ چت قطع شد.", keypad=main_kb)
+                            try:
+                                await bot.send_message(p, "❌ طرف مقابل چت را قطع کرد.", chat_keypad=main_kb)
+                            except Exception:
+                                pass
+                        return
+
+                    if bot_id in anon_active and chat_id in anon_active[bot_id]:
+                        if contains_bad_word(txt):
+                            await safe_send(bot, chat_id, "❌ نامناسب.")
+                            return
+                        if contains_link(txt):
+                            await safe_send(bot, chat_id, "❌ لینک ممنوع.")
+                            return
+                        p = anon_active[bot_id][chat_id]
+                        try:
+                            await bot.send_message(p, raw)
+                        except Exception:
+                            await safe_send(bot, chat_id, "❌ طرف مقابل رفت.", keypad=main_kb)
+                            anon_active[bot_id].pop(chat_id, None)
+                            anon_active[bot_id].pop(p, None)
+                        return
+
+                    if txt == "🚪 خروج از گروه":
+                        if bot_id in anon_group and chat_id in anon_group[bot_id]:
+                            anon_group[bot_id].remove(chat_id)
+                            await safe_send(bot, chat_id, "✅ خارج شدی.", keypad=main_kb)
+                        return
+
+                    if bot_id in anon_group and chat_id in anon_group[bot_id]:
+                        if contains_bad_word(txt):
+                            await safe_send(bot, chat_id, "❌ نامناسب.")
+                            return
+                        for uid2 in anon_group[bot_id]:
+                            if uid2 != chat_id:
+                                try:
+                                    await bot.send_message(uid2, f"👤 {u['name']}:\n{raw}")
+                                except Exception:
+                                    pass
+                        return
+
+                    if await is_adm(chat_id):
+                        if txt == "📈 آمار کاربران":
+                            cnt = await cnt_users()
+                            await safe_send(bot, chat_id, f"📈 کاربران: {cnt}", keypad=admin_kb)
+                            return
+                        if txt == "➕ افزایش سکه":
+                            await upd_u(chat_id, step="a_add_id")
+                            await safe_send(bot, chat_id, "🆔 کاربر:", keypad=cancel_kb_local)
+                            return
+                        if txt == "🔄 صفر کردن سکه":
+                            await upd_u(chat_id, step="a_reset")
+                            await safe_send(bot, chat_id, "🆔 کاربر:", keypad=cancel_kb_local)
+                            return
+                        if txt == "🎁 ایجاد کد هدیه":
+                            await upd_u(chat_id, step="a_g_am")
+                            await safe_send(bot, chat_id, "💰 مقدار:", keypad=cancel_kb_local)
+                            return
+                        if txt == "📢 پیام همگانی":
+                            await upd_u(chat_id, step="a_bc")
+                            await safe_send(bot, chat_id, "✍️ متن:", keypad=cancel_kb_local)
+                            return
+                        if txt == "🚫 بن کاربر":
+                            await upd_u(chat_id, step="a_ban")
+                            await safe_send(bot, chat_id, "🆔 کاربر:", keypad=cancel_kb_local)
+                            return
+                        if txt == "✅ آنبن کاربر":
+                            await upd_u(chat_id, step="a_unban")
+                            await safe_send(bot, chat_id, "🆔 کاربر:", keypad=cancel_kb_local)
+                            return
+                        if txt == "⚙️ سکه روزانه":
+                            await upd_u(chat_id, step="a_daily")
+                            await safe_send(bot, chat_id, "💰 مقدار:", keypad=cancel_kb_local)
+                            return
+                        if txt == "💰 تنظیم قیمت سکه":
+                            await upd_u(chat_id, step="a_prices")
+                            await safe_send(bot, chat_id, "فرمت: 10:5000|20:10000", keypad=cancel_kb_local)
+                            return
+                        if txt == "💳 تنظیم شماره کارت":
+                            await upd_u(chat_id, step="a_card")
+                            await safe_send(bot, chat_id, "💳 شماره کارت:", keypad=cancel_kb_local)
+                            return
+                        if txt == "🔐 تغییر رمز":
+                            await upd_u(chat_id, step="a_pass")
+                            await safe_send(bot, chat_id, "🔑 رمز جدید:", keypad=cancel_kb_local)
+                            return
+                        if txt == "📨 پشتیبانی":
+                            await safe_send(bot, chat_id, "پنل پشتیبانی:", keypad=support_admin_kb)
+                            return
+                        if txt == "📨 مشاهده پیام‌ها":
+                            db = await conn()
+                            rows = []
+                            try:
+                                async with db.cursor() as c:
+                                    await c.execute("SELECT mid,uid,name,msg FROM support WHERE status='new'")
+                                    rows = await c.fetchall()
+                            finally:
+                                await db.close()
+                            if not rows:
+                                await safe_send(bot, chat_id, "📭 خالی.", keypad=support_admin_kb)
+                                return
+                            out = "📨 پیام‌ها:\n\n"
+                            for m in rows:
+                                out += f"🆕 {m[0][:8]}\n👤 {m[2]}\n📝 {m[3]}\n\n"
+                            await safe_send(bot, chat_id, out, keypad=support_admin_kb)
+                            return
+                        if txt == "📤 پاسخ به کاربر":
+                            await upd_u(chat_id, step="a_reply_id")
+                            await safe_send(bot, chat_id, "🆔 کد پیام:", keypad=cancel_kb_local)
+                            return
+                        if txt == "🔙 خروج از پنل":
+                            await safe_send(bot, chat_id, "✅ خارج شدی.", keypad=main_kb)
+                            return
+
+                    ap = await get_set("admin_pass", admin_password)
+                    if txt == ap and ap:
+                        await add_adm(chat_id)
+                        await upd_u(chat_id, step=None)
+                        await safe_send(bot, chat_id, "✅ پنل فعال شد.", keypad=admin_kb)
+                        return
+
+                    await safe_send(bot, chat_id, "❌ دستور نامعتبر.", keypad=main_kb)
+
+                except Exception as e:
+                    logger.error(f"anon handler: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            await bot.start()
+            retry = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            retry += 1
+            w = min(60, 5 * retry)
+            logger.error(f"anon {bot_id} err: {e}, retry in {w}s")
+            await asyncio.sleep(w)
+
+
+async def run_group(owner, bot_id, token, admin_password):
+    retry = 0
+    while retry < 10:
+        try:
+            bot = Bot(token)
+            bdir = os.path.join(DATA_DIR, f"group_{bot_id}")
+            os.makedirs(bdir, exist_ok=True)
+            dbpath = os.path.join(bdir, "data.db")
+
+            async def conn():
+                return await aiosqlite.connect(dbpath)
+
+            db = await conn()
+            try:
+                async with db.cursor() as c:
+                    await c.execute("""CREATE TABLE IF NOT EXISTS groups (
+                        chat_id TEXT PRIMARY KEY, owner TEXT, pass TEXT, active INTEGER DEFAULT 1)""")
+                    await c.execute("""CREATE TABLE IF NOT EXISTS members (
+                        chat_id TEXT, uid TEXT, name TEXT, PRIMARY KEY (chat_id, uid))""")
+                    await c.execute("""CREATE TABLE IF NOT EXISTS banned (
+                        chat_id TEXT, uid TEXT, PRIMARY KEY (chat_id, uid))""")
+                    await c.execute("""CREATE TABLE IF NOT EXISTS warns (
+                        chat_id TEXT, uid TEXT, cnt INTEGER DEFAULT 0, PRIMARY KEY (chat_id, uid))""")
+                    await c.execute("""CREATE TABLE IF NOT EXISTS mutes (
+                        chat_id TEXT, uid TEXT, until INTEGER DEFAULT 0, PRIMARY KEY (chat_id, uid))""")
+                    await c.execute("""CREATE TABLE IF NOT EXISTS locks (
+                        chat_id TEXT, name TEXT, val INTEGER DEFAULT 0, PRIMARY KEY (chat_id, name))""")
+                    await c.execute("""CREATE TABLE IF NOT EXISTS stats (
+                        chat_id TEXT, uid TEXT, cnt INTEGER DEFAULT 0, PRIMARY KEY (chat_id, uid))""")
+                    await c.execute("""CREATE TABLE IF NOT EXISTS settings (
+                        chat_id TEXT, key TEXT, value TEXT, PRIMARY KEY (chat_id, key))""")
+                    await c.execute("""CREATE TABLE IF NOT EXISTS msgs (
+                        chat_id TEXT, msg_id TEXT, uid TEXT, PRIMARY KEY (chat_id, msg_id))""")
+                    await db.commit()
+            finally:
+                await db.close()
+
+            async def grp_exists(cid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT 1 FROM groups WHERE chat_id=?", (str(cid),))
+                        return (await c.fetchone()) is not None
+                finally:
+                    await db.close()
+
+            async def create_grp(cid, own, pwd):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("INSERT OR REPLACE INTO groups VALUES (?,?,?,1)",
+                                        (str(cid), str(own), pwd))
+                        for lk in ("link", "file", "forward", "hashtag", "mention"):
+                            await c.execute("INSERT OR IGNORE INTO locks VALUES (?,?,0)", (str(cid), lk))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def is_owner(cid, uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT 1 FROM groups WHERE chat_id=? AND owner=?",
+                                        (str(cid), str(uid)))
+                        return (await c.fetchone()) is not None
+                finally:
+                    await db.close()
+
+            async def is_admin_grp(cid, uid):
+                if await is_owner(cid, uid):
+                    return True
+                try:
+                    admins = await bot.get_chat_admins(cid)
+                    ids = []
+                    data = admins.get("data", admins) if isinstance(admins, dict) else admins
+                    arr = data.get("admins", []) if isinstance(data, dict) else []
+                    if not arr and isinstance(admins, list):
+                        arr = admins
+                    for a in arr:
+                        if isinstance(a, dict):
+                            v = a.get("user_id") or a.get("id")
+                            if v:
+                                ids.append(str(v))
+                        elif isinstance(a, (str, int)):
+                            ids.append(str(a))
+                    return str(uid) in ids
+                except Exception:
+                    return True
+
+            async def save_msg(cid, mid, uid):
+                try:
+                    db = await conn()
+                    try:
+                        async with db.cursor() as c:
+                            await c.execute("INSERT OR REPLACE INTO msgs VALUES (?,?,?)",
+                                            (str(cid), str(mid), str(uid)))
+                            await db.commit()
+                    finally:
+                        await db.close()
+                except Exception:
+                    pass
+
+            async def get_msg_uid(cid, mid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT uid FROM msgs WHERE chat_id=? AND msg_id=?",
+                                        (str(cid), str(mid)))
+                        r = await c.fetchone()
+                        return r[0] if r else None
+                finally:
+                    await db.close()
+
+            async def get_name(cid, uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT name FROM members WHERE chat_id=? AND uid=?",
+                                        (str(cid), str(uid)))
+                        r = await c.fetchone()
+                        return r[0] if r and r[0] else f"کاربر {str(uid)[:6]}"
+                finally:
+                    await db.close()
+
+            async def save_member(cid, uid, name):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("INSERT OR REPLACE INTO members VALUES (?,?,?)",
+                                        (str(cid), str(uid), name))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def ban_u(cid, uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("INSERT OR IGNORE INTO banned VALUES (?,?)", (str(cid), str(uid)))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def unban_u(cid, uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("DELETE FROM banned WHERE chat_id=? AND uid=?", (str(cid), str(uid)))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def is_banned(cid, uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT 1 FROM banned WHERE chat_id=? AND uid=?",
+                                        (str(cid), str(uid)))
+                        return (await c.fetchone()) is not None
+                finally:
+                    await db.close()
+
+            async def list_banned(cid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT uid FROM banned WHERE chat_id=?", (str(cid),))
+                        return [r[0] for r in await c.fetchall()]
+                finally:
+                    await db.close()
+
+            async def add_warn(cid, uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("""INSERT INTO warns VALUES (?,?,1)
+                            ON CONFLICT(chat_id,uid) DO UPDATE SET cnt=cnt+1""",
+                                        (str(cid), str(uid)))
+                        await db.commit()
+                        await c.execute("SELECT cnt FROM warns WHERE chat_id=? AND uid=?",
+                                        (str(cid), str(uid)))
+                        return (await c.fetchone())[0]
+                finally:
+                    await db.close()
+
+            async def get_warns(cid, uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT cnt FROM warns WHERE chat_id=? AND uid=?",
+                                        (str(cid), str(uid)))
+                        r = await c.fetchone()
+                        return r[0] if r else 0
+                finally:
+                    await db.close()
+
+            async def rm_warn(cid, uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("UPDATE warns SET cnt=cnt-1 WHERE chat_id=? AND uid=? AND cnt>0",
+                                        (str(cid), str(uid)))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def list_warns(cid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT uid, cnt FROM warns WHERE chat_id=? AND cnt>0",
+                                        (str(cid),))
+                        return await c.fetchall()
+                finally:
+                    await db.close()
+
+            async def get_thr(cid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT value FROM settings WHERE chat_id=? AND key='thr'",
+                                        (str(cid),))
+                        r = await c.fetchone()
+                        return int(r[0]) if r else 3
+                finally:
+                    await db.close()
+
+            async def set_thr(cid, v):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("INSERT OR REPLACE INTO settings VALUES (?, 'thr', ?)",
+                                        (str(cid), str(v)))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def set_lock(cid, k, v):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("INSERT OR REPLACE INTO locks VALUES (?,?,?)",
+                                        (str(cid), k, 1 if v else 0))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def get_locks(cid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT name, val FROM locks WHERE chat_id=?", (str(cid),))
+                        return {r[0]: bool(r[1]) for r in await c.fetchall()}
+                finally:
+                    await db.close()
+
+            async def inc_stat(cid, uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("""INSERT INTO stats VALUES (?,?,1)
+                            ON CONFLICT(chat_id,uid) DO UPDATE SET cnt=cnt+1""",
+                                        (str(cid), str(uid)))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def get_stat(cid, uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT cnt FROM stats WHERE chat_id=? AND uid=?",
+                                        (str(cid), str(uid)))
+                        r = await c.fetchone()
+                        return r[0] if r else 0
+                finally:
+                    await db.close()
+
+            async def mute_u(cid, uid, dur):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        until = int(time.time()) + dur if dur > 0 else -1
+                        await c.execute("INSERT OR REPLACE INTO mutes VALUES (?,?,?)",
+                                        (str(cid), str(uid), until))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def is_muted(cid, uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT until FROM mutes WHERE chat_id=? AND uid=?",
+                                        (str(cid), str(uid)))
+                        r = await c.fetchone()
+                        if not r:
+                            return False, 0
+                        if r[0] == -1:
+                            return True, -1
+                        rem = r[0] - int(time.time())
+                        if rem > 0:
+                            return True, rem
+                        await c.execute("DELETE FROM mutes WHERE chat_id=? AND uid=?",
+                                        (str(cid), str(uid)))
+                        await db.commit()
+                        return False, 0
+                finally:
+                    await db.close()
+
+            async def rm_mute(cid, uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("DELETE FROM mutes WHERE chat_id=? AND uid=?",
+                                        (str(cid), str(uid)))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def list_mutes(cid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT uid FROM mutes WHERE chat_id=?", (str(cid),))
+                        return [r[0] for r in await c.fetchall()]
+                finally:
+                    await db.close()
+
+            async def clear_mutes(cid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("DELETE FROM mutes WHERE chat_id=?", (str(cid),))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            gkb = make_keypad([
+                ["📚 آموزش فعال‌سازی"],
+                ["📢 کانال دستورات"],
+                ["📞 پشتیبانی"],
+            ])
+
+            @bot.on_new_message()
+            async def group_handler(bot, event):
+                try:
+                    cid = str(event.chat_id)
+                    raw = event.text or ""
+                    txt = resolve_button(raw)
+                    uid = str(event.author_id)
+
+                    if is_private_chat(cid):
+                        if raw.startswith("/start") or raw == "سلام":
+                            await safe_send(bot, cid,
+                                "👋 خوش آمدید!\n\nاین ربات برای مدیریت گروه‌هاست.\n"
+                                "ربات رو به گروه اضافه کن و «فعال» رو بفرست.",
+                                keypad=gkb)
+                            return
+                        if txt == "📚 آموزش فعال‌سازی":
+                            await safe_send(bot, cid,
+                                "📚 آموزش:\n1️⃣ اضافه کن\n2️⃣ ادمین کن\n3️⃣ «فعال» بفرست\n4️⃣ /admin",
+                                keypad=gkb)
+                            return
+                        if txt == "📢 کانال دستورات":
+                            await safe_send(bot, cid, "📢 @Pv_REGNOR", keypad=gkb)
+                            return
+                        if txt == "📞 پشتیبانی":
+                            await safe_send(bot, cid, "📞 @Pv_REGNOR", keypad=gkb)
+                            return
+                        return
+
+                    if not is_group_chat(cid):
+                        return
+
+                    if txt in ("فعال", "فعال کن", "فعالسازی", "نصب", "نصب کن", "مالک"):
+                        if await grp_exists(cid):
+                            if "فعال" in txt or "فعال" in raw:
+                                await safe_send(bot, cid,
+                                    "✅ گروه فعال است.\n📌 /admin برای پنل ادمین", keypad=gkb)
+                            return
+                        is_adm_flag = True
+                        try:
+                            admins = await bot.get_chat_admins(cid)
+                            ids = []
+                            data = admins.get("data", admins) if isinstance(admins, dict) else admins
+                            arr = data.get("admins", []) if isinstance(data, dict) else []
+                            if not arr and isinstance(admins, list):
+                                arr = admins
+                            for a in arr:
+                                if isinstance(a, dict):
+                                    v = a.get("user_id") or a.get("id")
+                                    if v:
+                                        ids.append(str(v))
+                                elif isinstance(a, (str, int)):
+                                    ids.append(str(a))
+                            if ids:
+                                is_adm_flag = uid in ids
+                        except Exception:
+                            pass
+                        if not is_adm_flag:
+                            await safe_send(bot, cid, "❌ فقط ادمین‌ها.")
+                            return
+                        await create_grp(cid, uid, admin_password)
+                        await safe_send(bot, cid,
+                            "✅ ربات نصب شد!\n📌 /admin - پنل ادمین\n"
+                            "📌 «بن» با ریپلای\n📌 «اخطار» با ریپلای\n📌 «سکوت 60» با ریپلای",
+                            keypad=gkb)
+                        return
+
+                    if not await grp_exists(cid):
+                        return
+
+                    if event.msg_id:
+                        await save_msg(cid, event.msg_id, uid)
+
+                    name = "کاربر"
+                    try:
+                        info = await bot.get_chat_info(cid)
+                        if info and hasattr(info, "data") and hasattr(info.data, "chat"):
+                            name = getattr(info.data.chat, "first_name", None) or name
+                    except Exception:
+                        pass
+                    await save_member(cid, uid, name)
+
+                    if await is_banned(cid, uid):
+                        try:
+                            await bot.delete_message(cid, event.msg_id)
+                        except Exception:
+                            pass
+                        return
+
+                    is_mut, rem = await is_muted(cid, uid)
+                    if is_mut:
+                        try:
+                            await bot.delete_message(cid, event.msg_id)
+                        except Exception:
+                            pass
+                        return
+
+                    await inc_stat(cid, uid)
+                    admin_flag = await is_admin_grp(cid, uid)
+
+                    if txt == "/admin":
+                        if not admin_flag:
+                            await safe_send(bot, cid, "❌ ادمین نیستید.")
+                            return
+                        await safe_send(bot, cid,
+                            "🛡️ پنل ادمین\n\n"
+                            "🚫 بن (با ریپلای)\n⚠️ اخطار (با ریپلای)\n"
+                            "❌ حذف اخطار\n✅ آنبن\n🔇 سکوت 60 / سکوت دائمی\n\n"
+                            "لیست بن / لیست اخطار / لیست قفل / لیست سکوت\n"
+                            "قفل لینک / بازکردن لینک\n"
+                            "سقف اخطار 5 / آمار گروه / آمار من")
+                        return
+
+                    if not admin_flag:
+                        locks = await get_locks(cid)
+                        if locks.get("link") and contains_link(raw):
+                            try:
+                                await bot.delete_message(cid, event.msg_id)
+                            except Exception:
+                                pass
+                            await safe_send(bot, cid, "🚫 لینک ممنوع!")
+                            return
+                        if locks.get("hashtag") and raw.startswith("#"):
+                            try:
+                                await bot.delete_message(cid, event.msg_id)
+                            except Exception:
+                                pass
+                            await safe_send(bot, cid, "🚫 هشتگ ممنوع!")
+                            return
+                        if locks.get("mention") and "@" in raw:
+                            try:
+                                await bot.delete_message(cid, event.msg_id)
+                            except Exception:
+                                pass
+                            await safe_send(bot, cid, "🚫 منشن ممنوع!")
+                            return
+                        return
+
+                    if txt == "بن" and event.reply_to_message_id:
+                        target = await get_msg_uid(cid, event.reply_to_message_id)
+                        if target:
+                            if target == uid:
+                                await safe_send(bot, cid, "❌ خودت رو نمی‌تونی!")
+                                return
+                            await ban_u(cid, target)
+                            try:
+                                await bot.ban_member(cid, target)
+                            except Exception as e:
+                                logger.warning(f"ban: {e}")
+                            try:
+                                await bot.delete_message(cid, event.reply_to_message_id)
+                            except Exception:
+                                pass
+                            try:
+                                await bot.delete_message(cid, event.msg_id)
+                            except Exception:
+                                pass
+                            nm = await get_name(cid, target)
+                            await safe_send(bot, cid, f"🚫 {nm} بن شد.")
+                        return
+
+                    if raw.startswith("بن "):
+                        target = raw[3:].strip()
+                        if target and target != uid:
+                            await ban_u(cid, target)
+                            try:
+                                await bot.ban_member(cid, target)
+                            except Exception:
+                                pass
+                            nm = await get_name(cid, target)
+                            await safe_send(bot, cid, f"🚫 {nm} بن شد.")
+                        return
+
+                    if txt == "آنبن" and event.reply_to_message_id:
+                        target = await get_msg_uid(cid, event.reply_to_message_id)
+                        if target:
+                            await unban_u(cid, target)
+                            try:
+                                await bot.unban_member(cid, target)
+                            except Exception:
+                                pass
+                            nm = await get_name(cid, target)
+                            await safe_send(bot, cid, f"✅ {nm} آنبن شد.")
+                        return
+
+                    if raw.startswith("آنبن "):
+                        target = raw[5:].strip()
+                        if target:
+                            await unban_u(cid, target)
+                            try:
+                                await bot.unban_member(cid, target)
+                            except Exception:
+                                pass
+                            await safe_send(bot, cid, "✅ آنبن شد.")
+                        return
+
+                    if txt == "اخطار" and event.reply_to_message_id:
+                        target = await get_msg_uid(cid, event.reply_to_message_id)
+                        if target and target != uid:
+                            cnt = await add_warn(cid, target)
+                            thr = await get_thr(cid)
+                            nm = await get_name(cid, target)
+                            if cnt >= thr:
+                                await ban_u(cid, target)
+                                try:
+                                    await bot.ban_member(cid, target)
+                                except Exception:
+                                    pass
+                                await safe_send(bot, cid, f"🚫 {nm} به {thr} اخطار رسید و بن شد!")
+                            else:
+                                await safe_send(bot, cid, f"⚠️ {nm}: {cnt}/{thr}")
+                        return
+
+                    if raw.startswith("اخطار "):
+                        target = raw[6:].strip()
+                        if target and target != uid:
+                            cnt = await add_warn(cid, target)
+                            thr = await get_thr(cid)
+                            nm = await get_name(cid, target)
+                            if cnt >= thr:
+                                await ban_u(cid, target)
+                                try:
+                                    await bot.ban_member(cid, target)
+                                except Exception:
+                                    pass
+                                await safe_send(bot, cid, f"🚫 {nm} بن شد!")
+                            else:
+                                await safe_send(bot, cid, f"⚠️ {nm}: {cnt}/{thr}")
+                        return
+
+                    if txt == "حذف اخطار" and event.reply_to_message_id:
+                        target = await get_msg_uid(cid, event.reply_to_message_id)
+                        if target:
+                            await rm_warn(cid, target)
+                            c = await get_warns(cid, target)
+                            nm = await get_name(cid, target)
+                            await safe_send(bot, cid, f"✅ اخطار {nm}: {c}")
+                        return
+
+                    if raw.startswith("سکوت"):
+                        if event.reply_to_message_id:
+                            target = await get_msg_uid(cid, event.reply_to_message_id)
+                            if target and target != uid:
+                                parts = raw.split()
+                                dur = 60
+                                if len(parts) >= 2:
+                                    if parts[1] in ("دائمی", "همیشه"):
+                                        dur = -1
+                                    elif parts[1].isdigit():
+                                        dur = int(parts[1])
+                                await mute_u(cid, target, dur)
+                                nm = await get_name(cid, target)
+                                await safe_send(bot, cid, f"🔇 {nm} سکوت شد.")
+                        return
+
+                    if txt == "حذف سکوت" and event.reply_to_message_id:
+                        target = await get_msg_uid(cid, event.reply_to_message_id)
+                        if target:
+                            await rm_mute(cid, target)
+                            nm = await get_name(cid, target)
+                            await safe_send(bot, cid, f"🔊 سکوت {nm} برداشته شد.")
+                        return
+
+                    if txt == "لیست بن":
+                        b = await list_banned(cid)
+                        if not b:
+                            await safe_send(bot, cid, "📭 خالی.")
+                            return
+                        out = "🚫 بن:\n\n"
+                        for u2 in b:
+                            out += f"• {await get_name(cid, u2)}\n"
+                        await safe_send(bot, cid, out)
+                        return
+
+                    if txt == "لیست اخطار":
+                        w = await list_warns(cid)
+                        if not w:
+                            await safe_send(bot, cid, "📭 خالی.")
+                            return
+                        thr = await get_thr(cid)
+                        out = "⚠️ اخطارها:\n\n"
+                        for u2, c in w:
+                            out += f"• {await get_name(cid, u2)} - {c}/{thr}\n"
+                        await safe_send(bot, cid, out)
+                        return
+
+                    if txt == "لیست قفل":
+                        lk = await get_locks(cid)
+                        names = {"link": "لینک", "file": "فایل", "forward": "فوروارد",
+                                 "hashtag": "هشتگ", "mention": "آیدی"}
+                        out = "🔒 قفل‌ها:\n\n"
+                        for k, n in names.items():
+                            v = "🔴" if lk.get(k) else "🟢"
+                            out += f"{v} {n}\n"
+                        await safe_send(bot, cid, out)
+                        return
+
+                    if txt == "لیست سکوت":
+                        m = await list_mutes(cid)
+                        if not m:
+                            await safe_send(bot, cid, "📭 خالی.")
+                            return
+                        out = "🔇 سکوت:\n\n"
+                        for u2 in m:
+                            out += f"• {await get_name(cid, u2)}\n"
+                        await safe_send(bot, cid, out)
+                        return
+
+                    if txt == "پاکسازی سکوت":
+                        await clear_mutes(cid)
+                        await safe_send(bot, cid, "✅ پاک شد.")
+                        return
+
+                    lock_map = {
+                        "قفل لینک": ("link", True), "بازکردن لینک": ("link", False),
+                        "قفل فایل": ("file", True), "بازکردن فایل": ("file", False),
+                        "قفل فوروارد": ("forward", True), "بازکردن فوروارد": ("forward", False),
+                        "قفل هشتگ": ("hashtag", True), "بازکردن هشتگ": ("hashtag", False),
+                        "قفل آیدی": ("mention", True), "بازکردن آیدی": ("mention", False),
+                    }
+                    if txt in lock_map:
+                        k, v = lock_map[txt]
+                        await set_lock(cid, k, v)
+                        st = "🔴 فعال" if v else "🟢 غیرفعال"
+                        await safe_send(bot, cid, f"✅ {txt}: {st}")
+                        return
+
+                    if raw.startswith("سقف اخطار"):
+                        m = re.search(r'\d+', raw)
+                        if m:
+                            v = int(m.group(0))
+                            if v > 0:
+                                await set_thr(cid, v)
+                                await safe_send(bot, cid, f"✅ سقف: {v}")
+                        return
+
+                    if txt == "آمار گروه":
+                        db = await conn()
+                        try:
+                            async with db.cursor() as c:
+                                await c.execute("SELECT SUM(cnt) FROM stats WHERE chat_id=?", (cid,))
+                                total = (await c.fetchone())[0] or 0
+                                await c.execute("SELECT COUNT(DISTINCT uid) FROM stats WHERE chat_id=?", (cid,))
+                                active = (await c.fetchone())[0] or 0
+                                await c.execute("SELECT uid, cnt FROM stats WHERE chat_id=? ORDER BY cnt DESC LIMIT 5", (cid,))
+                                top = await c.fetchall()
+                        finally:
+                            await db.close()
+                        out = f"📊 آمار گروه\n\n💬 کل: {total}\n👥 کاربران: {active}\n\n"
+                        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+                        for i, (u2, cnt) in enumerate(top):
+                            out += f"{medals[i]} {await get_name(cid, u2)} - {cnt}\n"
+                        await safe_send(bot, cid, out)
+                        return
+
+                    if txt == "آمار من":
+                        c = await get_stat(cid, uid)
+                        w = await get_warns(cid, uid)
+                        t = await get_thr(cid)
+                        await safe_send(bot, cid, f"📊 شما:\n💬 {c}\n⚠️ {w}/{t}")
+                        return
+
+                    if txt == "پشتیبانی":
+                        await safe_send(bot, cid, "📞 @Pv_REGNOR")
+                        return
+
+                    if txt == "افزودن ادمین" and event.reply_to_message_id:
+                        if not await is_owner(cid, uid):
+                            await safe_send(bot, cid, "❌ فقط مالک.")
+                            return
+                        target = await get_msg_uid(cid, event.reply_to_message_id)
+                        if target:
+                            nm = await get_name(cid, target)
+                            await safe_send(bot, cid, f"✅ {nm} ادمین کمکی شد.")
+                        return
+
+                    if txt == "حذف ادمین" and event.reply_to_message_id:
+                        if not await is_owner(cid, uid):
+                            await safe_send(bot, cid, "❌ فقط مالک.")
+                            return
+                        target = await get_msg_uid(cid, event.reply_to_message_id)
+                        if target:
+                            nm = await get_name(cid, target)
+                            await safe_send(bot, cid, f"✅ {nm} حذف شد.")
+                        return
+
+                except Exception as e:
+                    logger.error(f"group handler: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            await bot.start()
+            retry = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            retry += 1
+            w = min(60, 5 * retry)
+            logger.error(f"group {bot_id} err: {e}, retry in {w}s")
+            await asyncio.sleep(w)
+
+
+COUNTRIES = [
+    "افغانستان", "آلبانی", "الجزایر", "آندورا", "آنگولا", "آرژانتین", "ارمنستان", "استرالیا",
+    "اتریش", "آذربایجان", "بحرین", "بنگلادش", "بلاروس", "بلژیک", "بولیوی", "برزیل",
+    "بلغارستان", "کامبوج", "کانادا", "چاد", "شیلی", "چین", "کلمبیا", "کرواسی",
+    "کوبا", "قبرس", "چک", "دانمارک", "مصر", "استونی", "اتیوپی", "فنلاند",
+    "فرانسه", "گرجستان", "آلمان", "غنا", "یونان", "مجارستان", "ایسلند",
+    "هند", "اندونزی", "ایران", "عراق", "ایرلند", "ایتالیا", "ژاپن",
+    "اردن", "قزاقستان", "کنیا", "کویت", "لتونی", "لبنان", "لیبی",
+    "لیتوانی", "لوکزامبورگ", "مالزی", "مالدیو", "مالت", "مکزیک",
+    "مولداوی", "مغولستان", "مراکش", "میانمار", "نپال", "هلند",
+    "نیوزیلند", "نیجریه", "کره شمالی", "نروژ", "عمان", "پاکستان",
+    "فلسطین", "پاناما", "پاراگوئه", "پرو", "فیلیپین", "لهستان",
+    "پرتغال", "قطر", "رومانی", "روسیه", "رواندا", "عربستان",
+    "سنگال", "صربستان", "سنگاپور", "اسلواکی", "اسلوونی", "سومالی",
+    "آفریقای جنوبی", "کره جنوبی", "اسپانیا", "سریلانکا", "سودان",
+    "سوئد", "سوئیس", "سوریه", "تاجیکستان", "تایلند", "تونس",
+    "ترکیه", "ترکمنستان", "اوکراین", "امارات", "بریتانیا",
+    "آمریکا", "اروگوئه", "ازبکستان", "ونزوئلا", "ویتنام", "یمن",
+    "زامبیا", "زیمبابوه",
+]
+
+
+async def run_war(owner, bot_id, token, admin_password):
+    retry = 0
+    while retry < 10:
+        try:
+            bot = Bot(token)
+            bdir = os.path.join(DATA_DIR, f"war_{bot_id}")
+            os.makedirs(bdir, exist_ok=True)
+            dbpath = os.path.join(bdir, "data.db")
+
+            async def conn():
+                return await aiosqlite.connect(dbpath)
+
+            db = await conn()
+            try:
+                async with db.cursor() as c:
+                    await c.execute("""CREATE TABLE IF NOT EXISTS players (
+                        uid TEXT PRIMARY KEY, name TEXT, country TEXT,
+                        hp INTEGER DEFAULT 100, power INTEGER DEFAULT 10,
+                        coins INTEGER DEFAULT 100, wins INTEGER DEFAULT 0,
+                        losses INTEGER DEFAULT 0, iron INTEGER DEFAULT 0,
+                        gold INTEGER DEFAULT 0, weapons INTEGER DEFAULT 0,
+                        alliance TEXT DEFAULT '')""")
+                    await c.execute("""CREATE TABLE IF NOT EXISTS alliances (
+                        name TEXT PRIMARY KEY, leader TEXT, members TEXT)""")
+                    await c.execute("""CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY, value TEXT)""")
+                    await db.commit()
+            finally:
+                await db.close()
+
+            async def get_p(uid):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT uid, name, country, hp, power, coins, wins, losses, iron, gold, weapons, alliance FROM players WHERE uid=?",
+                                        (str(uid),))
+                        r = await c.fetchone()
+                finally:
+                    await db.close()
+                if not r:
+                    return None
+                return {"uid": r[0], "name": r[1], "country": r[2], "hp": r[3],
+                        "power": r[4], "coins": r[5], "wins": r[6], "losses": r[7],
+                        "iron": r[8], "gold": r[9], "weapons": r[10], "alliance": r[11]}
+
+            async def save_p(uid, **kw):
+                if not kw:
+                    return
+                f = ",".join(f"{k}=?" for k in kw)
+                v = list(kw.values()) + [str(uid)]
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute(f"UPDATE players SET {f} WHERE uid=?", v)
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            async def get_set(k, d=""):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT value FROM settings WHERE key=?", (k,))
+                        r = await c.fetchone()
+                        return r[0] if r else d
+                finally:
+                    await db.close()
+
+            async def set_set(k, v):
+                db = await conn()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (k, str(v)))
+                        await db.commit()
+                finally:
+                    await db.close()
+
+            def main_kb():
+                return make_keypad([
+                    ["👤 پروفایل", "🌍 کشور من"],
+                    ["⛏️ معدن", "🛒 بازار سلاح"],
+                    ["🤝 اتحاد", "💱 تجارت"],
+                    ["⚔️ حمله", "📊 رتبه‌بندی"],
+                    ["📣 بیانیه", "🛡️ پنل مدیریت"],
+                    ["ℹ️ راهنما"],
+                ])
+
+            def country_kb(page=0):
+                per = 12
+                chunk = COUNTRIES[page * per:(page + 1) * per]
+                rows = [[f"🌐 {c}"] for c in chunk]
+                nav = []
+                if page > 0:
+                    nav.append("⬅️ قبلی")
+                if (page + 1) * per < len(COUNTRIES):
+                    nav.append("➡️ بعدی")
+                if nav:
+                    rows.append(nav)
+                return make_keypad(rows)
+
+            async def post_ch(body):
+                ch = await get_set("statement_channel", "")
+                if not ch:
+                    return False, "کانال تنظیم نشده."
+                try:
+                    await bot.send_message(ch, body)
+                    return True, ""
+                except Exception as e:
+                    return False, str(e)
+
+            @bot.on_new_message()
+            async def war_handler(bot, event):
+                try:
+                    cid = str(event.chat_id)
+                    raw = (event.text or "").strip()
+                    txt = resolve_button(raw)
+                    uid = str(event.author_id)
+
+                    if is_group_chat(cid):
+                        if raw == "فعال":
+                            try:
+                                await bot.send_message(cid, "✅ کانال بیانیه فعال شد.")
+                                await set_set("statement_channel", cid)
+                            except Exception as e:
+                                logger.warning(f"war ch: {e}")
+                        return
+
+                    if not is_private_chat(cid):
+                        return
+
+                    if txt.startswith("⬅️") or txt.startswith("➡️"):
+                        await safe_send(bot, cid, "🌍 کشورت رو انتخاب کن:", keypad=country_kb())
+                        return
+
+                    if raw.startswith("🌐 "):
+                        country = raw[2:].strip()
+                        if country in COUNTRIES:
+                            nm = "فرمانده"
+                            try:
+                                info = await bot.get_chat_info(cid)
+                                if info and hasattr(info, "data") and hasattr(info.data, "chat"):
+                                    nm = getattr(info.data.chat, "first_name", None) or nm
+                            except Exception:
+                                pass
+                            db = await conn()
+                            try:
+                                async with db.cursor() as c:
+                                    await c.execute("""INSERT INTO players (uid,name,country) VALUES (?,?,?)
+                                        ON CONFLICT(uid) DO UPDATE SET country=excluded.country""",
+                                                    (uid, nm, country))
+                                    await db.commit()
+                            finally:
+                                await db.close()
+                            await safe_send(bot, cid,
+                                f"✅ کشور تو: {country}\nاز این پس وارد بازی هستی.",
+                                keypad=main_kb())
+                        return
+
+                    if raw.startswith("/start") or raw == "شروع" or txt == "🔙 بازگشت":
+                        p = await get_p(uid)
+                        if not p or not p.get("country"):
+                            await safe_send(bot, cid,
+                                "⚔️ به جنگ جهانی خوش آمدی!\n\n🌍 کشورت رو انتخاب کن:",
+                                keypad=country_kb())
+                            return
+                        await safe_send(bot, cid,
+                            f"⚔️ خوش آمدی {p['name']}!\n🌍 {p['country']}\n"
+                            f"💰 {p['coins']} سکه", keypad=main_kb())
+                        return
+
+                    p = await get_p(uid)
+                    if not p or not p.get("country"):
+                        await safe_send(bot, cid, "⛔ اول /start بفرست.", keypad=country_kb())
+                        return
+
+                    if txt == "👤 پروفایل":
+                        await safe_send(bot, cid,
+                            f"👤 {p['name']}\n🌍 {p['country']}\n❤️ {p['hp']}\n"
+                            f"⚡ {p['power']}\n💰 {p['coins']}\n⛏️ {p['iron']}\n"
+                            f"🥇 {p['gold']}\n🗡️ {p['weapons']}\n🤝 {p.get('alliance') or 'ندارد'}\n"
+                            f"🏆 {p['wins']} | 💔 {p['losses']}", keypad=main_kb())
+                        return
+
+                    if txt == "🌍 کشور من":
+                        await safe_send(bot, cid, "🌍 کشور جدید:", keypad=country_kb())
+                        return
+
+                    if txt == "⛏️ معدن":
+                        iron = random.randint(5, 15)
+                        gold = random.randint(0, 3)
+                        coins = random.randint(2, 8)
+                        await save_p(uid, iron=p['iron'] + iron, gold=p['gold'] + gold, coins=p['coins'] + coins)
+                        await safe_send(bot, cid,
+                            f"⛏️ استخراج!\n🔩 +{iron}\n🥇 +{gold}\n💰 +{coins}",
+                            keypad=main_kb())
+                        return
+
+                    if txt == "🛒 بازار سلاح":
+                        kb = make_keypad([
+                            ["🗡️ شمشیر — 30"],
+                            ["🏹 کمان — 45"],
+                            ["💣 توپ — 70"],
+                            ["🔙 بازگشت"],
+                        ])
+                        await safe_send(bot, cid, "🛒 انتخاب کن:", keypad=kb)
+                        return
+
+                    for w, cost, pw in [("شمشیر", 30, 5), ("کمان", 45, 10), ("توپ", 70, 20)]:
+                        if w in txt and ("🗡️" in txt or "🏹" in txt or "💣" in txt):
+                            if p['coins'] < cost:
+                                await safe_send(bot, cid, "❌ سکه کم.", keypad=main_kb())
+                                return
+                            await save_p(uid, coins=p['coins'] - cost,
+                                         power=min(1000, p['power'] + pw),
+                                         weapons=p['weapons'] + 1)
+                            await safe_send(bot, cid, f"✅ {w} خریداری شد! +{pw} قدرت", keypad=main_kb())
+                            return
+
+                    if txt == "💱 تجارت":
+                        if p['iron'] >= 10:
+                            await save_p(uid, iron=p['iron'] - 10, coins=p['coins'] + 25)
+                            await safe_send(bot, cid, "💱 ۱۰ آهن → ۲۵ سکه", keypad=main_kb())
+                        else:
+                            await safe_send(bot, cid, "❌ حداقل ۱۰ آهن.", keypad=main_kb())
+                        return
+
+                    if txt == "🤝 اتحاد":
+                        await safe_send(bot, cid, "🤝 اتحاد:",
+                                        keypad=make_keypad([["➕ ساخت اتحاد"], ["🔙 بازگشت"]]))
+                        return
+
+                    if txt == "➕ ساخت اتحاد":
+                        await set_set(f"st_{uid}", "alliance_create")
+                        await safe_send(bot, cid, "✍️ نام اتحاد:", keypad=main_kb())
+                        return
+
+                    st = await get_set(f"st_{uid}", "")
+                    if st == "alliance_create" and raw:
+                        name = raw[:32]
+                        db = await conn()
+                        try:
+                            async with db.cursor() as c:
+                                await c.execute("INSERT OR IGNORE INTO alliances VALUES (?,?,?)",
+                                                (name, uid, json.dumps([uid])))
+                                await db.commit()
+                        finally:
+                            await db.close()
+                        await save_p(uid, alliance=name)
+                        await set_set(f"st_{uid}", "")
+                        await safe_send(bot, cid, f"✅ اتحاد «{name}» ساخته شد.", keypad=main_kb())
+                        return
+
+                    if raw.startswith("پیوستن:"):
+                        name = raw.split(":", 1)[1].strip()
+                        db = await conn()
+                        try:
+                            async with db.cursor() as c:
+                                await c.execute("SELECT members FROM alliances WHERE name=?", (name,))
+                                r = await c.fetchone()
+                                if r:
+                                    mem = json.loads(r[0] or "[]")
+                                    if uid not in mem:
+                                        mem.append(uid)
+                                    await c.execute("UPDATE alliances SET members=? WHERE name=?",
+                                                    (json.dumps(mem), name))
+                                    await db.commit()
+                                    await save_p(uid, alliance=name)
+                        finally:
+                            await db.close()
+                        await safe_send(bot, cid, f"✅ به {name} پیوستی.", keypad=main_kb())
+                        return
+
+                    if txt == "⚔️ حمله":
+                        db = await conn()
+                        try:
+                            async with db.cursor() as c:
+                                await c.execute("""SELECT uid,name,country,hp,power,wins,losses
+                                    FROM players WHERE uid<>? AND hp>0 ORDER BY RANDOM() LIMIT 1""", (uid,))
+                                r = await c.fetchone()
+                        finally:
+                            await db.close()
+                        if not r:
+                            await safe_send(bot, cid, "⚔️ حریفی نیست.", keypad=main_kb())
+                            return
+                        tu, tn, tc, thp, tpow, tw, tl = r
+                        dmg = random.randint(max(1, p['power'] // 3), max(2, p['power']))
+                        nhp = max(0, int(thp) - dmg)
+                        await save_p(tu, hp=nhp, losses=int(tl) + (1 if nhp == 0 else 0))
+                        await save_p(uid, wins=p['wins'] + (1 if nhp == 0 else 0), coins=p['coins'] + 5)
+                        rep = (f"⚔️ حمله!\n🏳️ {p['country']}\n🎯 {tc}\n"
+                               f"💥 {dmg}\n❤️ {nhp}\n💰 +5")
+                        await safe_send(bot, cid, rep, keypad=main_kb())
+                        await post_ch(rep)
+                        return
+
+                    if txt == "📊 رتبه‌بندی":
+                        db = await conn()
+                        try:
+                            async with db.cursor() as c:
+                                await c.execute("""SELECT name,country,wins,power FROM players
+                                    ORDER BY wins DESC, power DESC LIMIT 10""")
+                                rows = await c.fetchall()
+                        finally:
+                            await db.close()
+                        out = "🏆 رتبه‌بندی:\n\n"
+                        for i, (nm, co, w, pw) in enumerate(rows, 1):
+                            out += f"{i}. {nm} — {co} | 🏆 {w} | ⚡ {pw}\n"
+                        await safe_send(bot, cid, out, keypad=main_kb())
+                        return
+
+                    if txt == "📣 بیانیه":
+                        await set_set(f"st_{uid}", "statement")
+                        await safe_send(bot, cid, "📣 متن بیانیه:", keypad=main_kb())
+                        return
+
+                    if st == "statement" and raw:
+                        ok, err = await post_ch(f"📣 {p['country']} - {p['name']}:\n\n{raw[:1500]}")
+                        await set_set(f"st_{uid}", "")
+                        await safe_send(bot, cid, "✅ منتشر شد." if ok else f"❌ {err}", keypad=main_kb())
+                        return
+
+                    if txt == "🛡️ پنل مدیریت":
+                        if uid != str(owner):
+                            await safe_send(bot, cid, "⛔ فقط مالک.", keypad=main_kb())
+                            return
+                        ch = await get_set("statement_channel", "تنظیم نشده")
+                        await safe_send(bot, cid,
+                            f"🛡️ پنل\n📣 کانال: {ch}\n🌍 کشورها: {len(COUNTRIES)}",
+                            keypad=main_kb())
+                        return
+
+                    if txt == "ℹ️ راهنما":
+                        await safe_send(bot, cid,
+                            "ℹ️ راهنما:\n1) /start\n2) معدن\n3) بازار سلاح\n"
+                            "4) تجارت\n5) اتحاد\n6) حمله\n7) بیانیه",
+                            keypad=main_kb())
+                        return
+
+                    await safe_send(bot, cid, "از دکمه‌ها استفاده کن.", keypad=main_kb())
+
+                except Exception as e:
+                    logger.error(f"war handler: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            await bot.start()
+            retry = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            retry += 1
+            w = min(60, 5 * retry)
+            logger.error(f"war {bot_id} err: {e}, retry in {w}s")
+            await asyncio.sleep(w)
+
+
+MAKER_MAIN = {"➕ ساخت ربات", "📋 ربات های من", "👤 پروفایل من", "👤 پروفایل",
+              "💳 خرید سکه", "💸 انتقال سکه", "💸 انتقال",
+              "⚙️ تنظیمات ربات ها", "🔐 پنل مدیریت",
+              "👥 زیر مجموعه گیری", "👥 زیرمجموعه",
+              "📞 پشتیبانی", "💰 دریافت سکه روزانه", "💰 سکه روزانه",
+              "🎁 وارد کردن کد هدیه", "🎁 کد هدیه", "🏆 کاربران برتر"}
+
+MAKER_ADMIN = {"📊 آمار ربات ساز", "📊 آمار", "👥 لیست کاربران",
+               "💰 اضافه کردن سکه", "💰 اضافه سکه",
+               "📢 پیام همگانی", "🌍 پیام همگانی فرزندها",
+               "💳 مشاهده پرداخت‌ها", "💳 پرداخت‌ها",
+               "🚫 بن کاربر", "✅ آنبن کاربر",
+               "✉️ ارسال پیام به کاربر", "✉️ پیام به کاربر",
+               "⚙️ تنظیم سکه روزانه", "⚙️ سکه روزانه",
+               "💳 تنظیم شماره کارت", "💳 شماره کارت",
+               "🎁 ساخت کد هدیه", "📋 لیست کدهای هدیه", "📋 لیست کدها",
+               "🔐 تغییر رمز مدیریت", "🔐 تغییر رمز",
+               "📨 پیام‌های پشتیبانی"}
+
+CREATION_MAP = {"🤖 چت ناشناس (10 سکه)": (10, "anonymous"),
+                "🤖 چت ناشناس (10)": (10, "anonymous"),
+                "👥 مدیریت گروه (15 سکه)": (15, "group"),
+                "👥 مدیریت گروه (15)": (15, "group"),
+                "⚔️ جنگ جهانی (20 سکه)": (20, "war"),
+                "⚔️ جنگ جهانی (20)": (20, "war")}
+
+
+@main_bot.on_new_message()
+async def main_handler(bot: Bot, event):
+    try:
+        cid = str(event.chat_id)
+        raw = event.text or ""
+        txt = resolve_button(raw)
+
+        if not is_private_chat(cid):
+            return
+
+        logger.info(f"📩 {cid[:15]} raw={raw!r} → {txt!r}")
+
+        user = await get_user(cid)
+        if not user:
+            name = "کاربر"
+            uname = "ندارد"
+            try:
+                info = await bot.get_chat_info(cid)
+                if info and hasattr(info, "data") and hasattr(info.data, "chat"):
+                    name = getattr(info.data.chat, "first_name", None) or name
+                    uname = getattr(info.data.chat, "username", None) or uname
+            except Exception:
+                pass
+            user = await create_user(cid, name, uname)
+            if not user:
+                return
+
+        is_adm_flag = (await is_admin(cid)) and cid in _MAKER_ADMIN_SESSIONS
+        if user.get("banned") and not is_adm_flag:
+            await safe_send(bot, cid, "🚫 شما بن شده‌اید.")
+            return
+
+        st = get_state(cid)
+        state = st.get("state")
+        info = st.get("data", {})
+
+        if raw.startswith("/start"):
+            clear_state(cid)
+            parts = raw.split()
+            if len(parts) > 1 and not user.get("invited_by"):
+                ref = parts[1].strip().upper()
+                ref_uid = await get_user_by_ref(ref)
+                if ref_uid and ref_uid != cid:
+                    await update_user(cid, invited_by=ref_uid)
+                    await add_coins(ref_uid, 2)
+                    try:
+                        await bot.send_message(ref_uid, "🎁 ۲ سکه از دعوت جدید!",
+                                               chat_keypad=main_menu_kb())
+                    except Exception:
+                        pass
+            await safe_send(bot, cid,
+                f"🚀 ربات ساز\n\n👤 {user['name']}\n💰 {user['coins']}\n"
+                f"👥 کاربران: {await count_users()}",
+                keypad=main_menu_kb())
+            return
+
+        if txt in ("❌ لغو", "🔙 بازگشت", "🔙 بازگشت به منوی اصلی"):
+            if txt == "🔙 بازگشت به منوی اصلی" and is_adm_flag:
+                _MAKER_ADMIN_SESSIONS.discard(cid)
+            clear_state(cid)
+            await safe_send(bot, cid, "✅ لغو شد.", keypad=main_menu_kb())
+            return
+
+        if txt in MAKER_MAIN:
+            clear_state(cid)
+
+            if txt in ("💰 دریافت سکه روزانه", "💰 سکه روزانه"):
+                today = str(datetime.date.today())
+                if user.get("daily_claimed") == today:
+                    await safe_send(bot, cid, "⚠️ امروز گرفتی.")
+                    return
+                am = await get_setting("daily_coins", 50)
+                await add_coins(cid, int(am))
+                await update_user(cid, daily_claimed=today)
+                fresh = await get_user(cid)
+                await safe_send(bot, cid, f"✅ {am} سکه\n💰 {fresh['coins']}")
+                return
+
+            if txt in ("🎁 وارد کردن کد هدیه", "🎁 کد هدیه"):
+                set_state(cid, "wait_gift")
+                await safe_send(bot, cid, "🔑 کد هدیه:", keypad=cancel_kb())
+                return
+
+            if txt in ("💸 انتقال سکه", "💸 انتقال"):
+                set_state(cid, "transfer_target")
+                await safe_send(bot, cid, "🆔 کاربر:", keypad=cancel_kb())
+                return
+
+            if txt == "💳 خرید سکه":
+                prices = await get_setting("coin_prices", {"10": 5000, "20": 10000, "50": 25000})
+                rows = []
+                try:
+                    items = sorted(prices.items(), key=lambda x: int(x[0]))
+                except Exception:
+                    items = list(prices.items())
+                for am, pr in items:
+                    rows.append([f"💎 {am} سکه | {int(pr):,}T"])
+                rows.append(["🔙 بازگشت"])
+                set_state(cid, "buy_coins")
+                await safe_send(bot, cid, "💳 پکیج:", keypad=make_keypad(rows))
+                return
+
+            if txt == "➕ ساخت ربات":
+                await safe_send(bot, cid, "🤖 نوع ربات:", keypad=creation_menu_kb())
+                return
+
+            if txt == "📋 ربات های من":
+                bl = await user_bots(cid)
+                if not bl:
+                    await safe_send(bot, cid, "📭 رباتی نداری.", keypad=main_menu_kb())
+                    return
+                out = "📋 ربات‌های تو:\n"
+                for bid, bt, act in bl:
+                    st2 = "🟢" if act else "🔴"
+                    tn = {"anonymous": "چت ناشناس", "group": "مدیریت گروه",
+                          "war": "جنگ جهانی"}.get(bt, "?")
+                    out += f"\n{st2} {tn}\n🔑 {bid}\n"
+                await safe_send(bot, cid, out, keypad=main_menu_kb())
+                return
+
+            if txt == "⚙️ تنظیمات ربات ها":
+                bl = await user_bots(cid)
+                if not bl:
+                    await safe_send(bot, cid, "❌ رباتی نداری.", keypad=main_menu_kb())
+                    return
+                rows = []
+                bots_map = {}
+                for bid, bt, act in bl:
+                    st2 = "🟢" if act else "🔴"
+                    tn = {"anonymous": "چت ناشناس", "group": "مدیریت گروه",
+                          "war": "جنگ جهانی"}.get(bt, "?")
+                    short = bid[:8]
+                    bots_map[short] = bid
+                    rows.append([f"{st2} {tn} ({short})"])
+                rows.append(["🔙 بازگشت"])
+                set_state(cid, "sel_bs", bots=bots_map)
+                await safe_send(bot, cid, "⚙️ انتخاب:", keypad=make_keypad(rows))
+                return
+
+            if txt in ("👤 پروفایل من", "👤 پروفایل"):
+                refs = await count_refs(cid)
+                bl = await user_bots(cid)
+                await safe_send(bot, cid,
+                    f"👤 پروفایل\n\n📛 {user['name']}\n"
+                    f"💰 {user['coins']}\n🎁 دعوت: {refs}\n"
+                    f"🤖 ربات: {len(bl)}\n🔑 {user['ref_code']}",
+                    keypad=main_menu_kb())
+                return
+
+            if txt in ("👥 زیر مجموعه گیری", "👥 زیرمجموعه"):
+                rc = user.get("ref_code") or ""
+                await safe_send(bot, cid,
+                    f"🎁 کد دعوت:\n\n{rc}\n\nلینک:\n/start {rc}\n\n💰 هر دعوت ۲ سکه",
+                    keypad=main_menu_kb())
+                return
+
+            if txt == "📞 پشتیبانی":
+                set_state(cid, "sup_msg")
+                await safe_send(bot, cid, "📝 پیام:", keypad=cancel_kb())
+                return
+
+            if txt == "🏆 کاربران برتر":
+                db = await db_connect()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT name, coins FROM users ORDER BY coins DESC LIMIT 10")
+                        rows = await c.fetchall()
+                finally:
+                    await db.close()
+                out = "🏆 برترین‌ها:\n\n"
+                medals = ["🥇", "🥈", "🥉"]
+                for i, (nm, co) in enumerate(rows):
+                    md = medals[i] if i < 3 else f"{i+1}."
+                    out += f"{md} {nm} - {co}\n"
+                await safe_send(bot, cid, out, keypad=main_menu_kb())
+                return
+
+            if txt == "🔐 پنل مدیریت":
+                now = time.time()
+                att = _admin_attempts.get(cid, [])
+                att = [t for t in att if now - t < 60]
+                if len(att) >= 5:
+                    await safe_send(bot, cid, "⛔ ۱ دقیقه صبر کن.")
+                    return
+                _admin_attempts[cid] = att
+                set_state(cid, "wait_pass")
+                await safe_send(bot, cid, "🔐 رمز:", keypad=cancel_kb())
+                return
+
+        if txt in CREATION_MAP:
+            cost, bt = CREATION_MAP[txt]
+            if user["coins"] >= cost:
+                set_state(cid, "wait_token", bot_type=bt, cost=cost)
+                await safe_send(bot, cid,
+                    f"✅ توکن ربات خود را ارسال کن:\n\n(💰 {cost} سکه کسر می‌شه)",
+                    keypad=cancel_kb())
+            else:
+                await safe_send(bot, cid,
+                    f"❌ سکه کم. نیاز: {cost} | داری: {user['coins']}")
+            return
+
+        if state == "wait_gift":
+            code = txt.strip()
+            used = user.get("used_gift_codes", [])
+            if code in used:
+                await safe_send(bot, cid, "⚠️ قبلاً استفاده کردی.")
+                clear_state(cid)
+                return
+            g = await get_gift(code)
+            if not g or g["capacity"] <= 0:
+                await safe_send(bot, cid, "❌ کد نامعتبر.")
+                clear_state(cid)
+                return
+            if await use_gift(code):
+                await add_coins(cid, g["amount"])
+                await update_user(cid, used_gift_codes=used + [code])
+                fresh = await get_user(cid)
+                await safe_send(bot, cid, f"✅ {g['amount']} سکه\n💰 {fresh['coins']}")
+            else:
+                await safe_send(bot, cid, "❌ منقضی.")
+            clear_state(cid)
+            return
+
+        if state == "transfer_target":
+            target, matches = await find_user(txt)
+            if target:
+                if target == cid:
+                    await safe_send(bot, cid, "❌ خودت رو نمی‌تونی.")
+                    return
+                tu = await get_user(target)
+                if not tu:
+                    await safe_send(bot, cid, "❌ پیدا نشد.")
+                    clear_state(cid)
+                    return
+                set_state(cid, "transfer_amount", target=target)
+                await safe_send(bot, cid, f"✅ {tu['name']}\n💰 مقدار:", keypad=cancel_kb())
+            elif matches:
+                out = f"⚠️ {len(matches)} کاربر:\n\n"
+                for m in matches[:10]:
+                    u2 = await get_user(m)
+                    if u2:
+                        out += f"📛 {u2['name']}\n🔢 {m}\n\n"
+                await safe_send(bot, cid, out)
+            else:
+                await safe_send(bot, cid, "❌ پیدا نشد.")
+            return
+
+        if state == "transfer_amount":
+            if not txt.isdigit() or int(txt) <= 0:
+                await safe_send(bot, cid, "❌ عدد مثبت.")
+                return
+            am = int(txt)
+            tgt = info.get("target")
+            tu = await get_user(tgt)
+            if not tu:
+                await safe_send(bot, cid, "❌ خطا.")
+                clear_state(cid)
+                return
+            if not await spend_coins(cid, am):
+                await safe_send(bot, cid, f"❌ سکه کم. داری: {user['coins']}")
+                return
+            await add_coins(tgt, am)
+            fresh = await get_user(cid)
+            await safe_send(bot, cid,
+                f"✅ {am} سکه به {tu['name']}\n💰 {fresh['coins']}",
+                keypad=main_menu_kb())
+            try:
+                await bot.send_message(tgt, f"💰 {am} سکه از {user['name']}!",
+                                       chat_keypad=main_menu_kb())
+            except Exception:
+                pass
+            clear_state(cid)
+            return
+
+        if state == "buy_coins":
+            m = re.search(r'(\d+)\s*سکه', raw)
+            if m:
+                am = m.group(1)
+                prices = await get_setting("coin_prices", {})
+                if am not in prices:
+                    await safe_send(bot, cid, "❌ نامعتبر.")
+                    return
+                pr = prices[am]
+                plan = f"💎 {am} سکه | {int(pr):,} تومان"
+                set_state(cid, "await_pay", plan=plan, amount=int(am), price=int(pr))
+                cn = await get_setting("card_number", "")
+                ch = await get_setting("card_holder", "")
+                await safe_send(bot, cid,
+                    f"💳 خرید {am} سکه - {int(pr):,}\n\n💳 کارت:\n{cn}\n\n👤 {ch}\n\n"
+                    f"پس از واریز پرداخت کردم رو بزن.",
+                    keypad=payment_kb())
+                return
+            return
+
+        if state == "await_pay":
+            if txt == "✅ پرداخت کردم":
+                plan = info.get("plan")
+                am = info.get("amount")
+                pr = info.get("price")
+                code = generate_order_code()
+                await create_payment(cid, plan, am, pr, code)
+                clear_state(cid)
+                await safe_send(bot, cid,
+                    f"🌟 درخواست ثبت شد.\n🔑 {code}\n📦 {plan}",
+                    keypad=main_menu_kb())
+                for a in await all_admins():
+                    try:
+                        await bot.send_message(a, f"📩 خرید جدید\n👤 {user['name']}\n🔑 {code}")
+                    except Exception:
+                        pass
+                return
+            return
+
+        if state == "wait_token":
+            if len(txt) < 30:
+                await safe_send(bot, cid, "❌ توکن نامعتبر. دوباره:")
+                return
+            set_state(cid, "wait_password",
+                      bot_type=info.get("bot_type"),
+                      token=txt, cost=info.get("cost", 0))
+            await safe_send(bot, cid, "🔐 رمز ادمین ربات (حداقل ۳ کاراکتر):", keypad=cancel_kb())
+            return
+
+        if state == "wait_password":
+            token = info.get("token")
+            bt = info.get("bot_type")
+            cost = info.get("cost", 0)
+            pwd = txt.strip()
+            bid = generate_bot_id(cid)
+            if len(pwd) < 3:
+                await safe_send(bot, cid, "❌ رمز حداقل ۳ کاراکتر:")
+                return
+            fresh = await get_user(cid)
+            if not fresh or fresh["coins"] < cost:
+                clear_state(cid)
+                await safe_send(bot, cid, "❌ سکه کافی نیست.")
+                return
+            try:
+                await save_bot(bid, cid, token, pwd, bt)
+            except Exception as e:
+                await safe_send(bot, cid, f"❌ خطا: {e}")
+                clear_state(cid)
+                return
+            try:
+                await start_child(cid, bid, token, pwd, bt)
+            except Exception as e:
+                await delete_bot(bid, owner=cid)
+                await safe_send(bot, cid, f"❌ خطا: {e}")
+                clear_state(cid)
+                return
+            await spend_coins(cid, cost)
+            tn = {"anonymous": "چت ناشناس", "group": "مدیریت گروه", "war": "جنگ جهانی"}.get(bt, "?")
+            await safe_send(bot, cid,
+                f"✅ ربات {tn} ساخته شد!\n💰 {cost} سکه کسر شد\n🔐 {pwd}\n\n"
+                f"📌 چت ناشناس: /start\n📌 گروه: فعال رو بفرست",
+                keypad=main_menu_kb())
+            clear_state(cid)
+            return
+
+        if state == "sel_bs":
+            bots_map = info.get("bots", {})
+            for short, full in bots_map.items():
+                if short in txt:
+                    if not await is_owner(full, cid):
+                        await safe_send(bot, cid, "❌ مال تو نیست.")
+                        clear_state(cid)
+                        return
+                    set_state(cid, "bs_menu", bot_id=full)
+                    await safe_send(bot, cid, "⚙️ تنظیمات:", keypad=bot_settings_kb())
+                    return
+            return
+
+        if state == "bs_menu":
+            bid = info.get("bot_id")
+            if not bid or not await is_owner(bid, cid):
+                await safe_send(bot, cid, "❌ مال تو نیست.")
+                clear_state(cid)
+                return
+            if txt in ("🔄 تغییر رمز مدیریت", "🔄 تغییر رمز"):
+                set_state(cid, "chg_pw", bot_id=bid)
+                await safe_send(bot, cid, "🔑 رمز جدید:", keypad=cancel_kb())
+                return
+            if txt in ("🔴 خاموش کردن ربات", "🔴 خاموش"):
+                await stop_child(cid, bid)
+                await safe_send(bot, cid, "🛑 خاموش شد.", keypad=main_menu_kb())
+                clear_state(cid)
+                return
+            if txt in ("🟢 روشن کردن ربات", "🟢 روشن"):
+                b = await get_bot(bid, owner=cid)
+                if b:
+                    try:
+                        await start_child(cid, bid, b["token"], b["plain_password"], b["bot_type"])
+                        await safe_send(bot, cid, "🟢 روشن شد.", keypad=main_menu_kb())
+                    except Exception as e:
+                        await safe_send(bot, cid, f"❌ {e}")
+                clear_state(cid)
+                return
+            if txt in ("🗑️ حذف ربات", "🗑️ حذف"):
+                set_state(cid, "confirm_del", bot_id=bid)
+                await safe_send(bot, cid, "⚠️ برای تایید «تایید حذف» رو بفرست.", keypad=cancel_kb())
+                return
+            return
+
+        if state == "chg_pw":
+            bid = info.get("bot_id")
+            new_pwd = txt.strip()
+            if len(new_pwd) < 3:
+                await safe_send(bot, cid, "❌ حداقل ۳ کاراکتر.")
+                return
+            if await update_bot_pwd(bid, cid, new_pwd):
+                await safe_send(bot, cid, f"✅ رمز: {new_pwd}", keypad=main_menu_kb())
+            else:
+                await safe_send(bot, cid, "❌ خطا.")
+            clear_state(cid)
+            return
+
+        if state == "confirm_del":
+            if txt == "تایید حذف":
+                bid = info.get("bot_id")
+                if bid:
+                    await remove_child(cid, bid)
+                    await safe_send(bot, cid, "✅ حذف شد.", keypad=main_menu_kb())
+                clear_state(cid)
+                return
+            clear_state(cid)
+            await safe_send(bot, cid, "❌ لغو شد.", keypad=main_menu_kb())
+            return
+
+        if state == "sup_msg":
+            if contains_bad_word(txt) or contains_link(txt):
+                await safe_send(bot, cid, "❌ نامناسب.")
+                clear_state(cid)
+                return
+            mid = await create_support(cid, user["name"], txt)
+            clear_state(cid)
+            await safe_send(bot, cid, f"✅ ارسال شد.\n🔑 {mid[:8]}", keypad=main_menu_kb())
+            for a in await all_admins():
+                try:
+                    await bot.send_message(a,
+                        f"📨 پشتیبانی\n👤 {user['name']}\n📝 {txt}\n🔑 {mid[:8]}")
+                except Exception:
+                    pass
+            return
+
+        if state == "wait_pass":
+            ap = await get_setting("admin_pass", MAKER_ADMIN_PASS)
+            now = time.time()
+            att = _admin_attempts.get(cid, [])
+            att = [t for t in att if now - t < 60]
+            if txt == ap and ap:
+                await add_admin(cid)
+                _MAKER_ADMIN_SESSIONS.add(cid)
+                clear_state(cid)
+                _admin_attempts.pop(cid, None)
+                await safe_send(bot, cid, "✅ ورود موفق!", keypad=admin_menu_kb())
+            else:
+                att.append(now)
+                _admin_attempts[cid] = att
+                clear_state(cid)
+                await safe_send(bot, cid, f"❌ رمز اشتباه. ({len(att)}/5)")
+            return
+
+        if is_adm_flag and txt in MAKER_ADMIN:
+            clear_state(cid)
+
+            if txt in ("📊 آمار ربات ساز", "📊 آمار"):
+                db = await db_connect()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT COUNT(*) FROM users")
+                        ucnt = (await c.fetchone())[0]
+                        await c.execute("SELECT COUNT(*) FROM bots")
+                        bcnt = (await c.fetchone())[0]
+                        await c.execute("SELECT COUNT(*) FROM bots WHERE is_active=1")
+                        abcnt = (await c.fetchone())[0]
+                finally:
+                    await db.close()
+                await safe_send(bot, cid,
+                    f"📊 آمار\n\n👥 کاربران: {ucnt}\n🤖 ربات‌ها: {bcnt}\n✅ فعال: {abcnt}",
+                    keypad=admin_menu_kb())
+                return
+
+            if txt == "👥 لیست کاربران":
+                db = await db_connect()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT uid,name,coins,ref_code FROM users LIMIT 30")
+                        rows = await c.fetchall()
+                finally:
+                    await db.close()
+                out = "👥 کاربران:\n\n"
+                for uid2, nm, co, rc in rows:
+                    out += f"👤 {nm}\n💰 {co}\n🔑 {rc}\n🔢 {uid2[:20]}\n\n"
+                for i in range(0, len(out), 3500):
+                    await safe_send(bot, cid, out[i:i+3500],
+                                    keypad=admin_menu_kb() if i == 0 else None)
+                return
+
+            if txt in ("💰 اضافه کردن سکه", "💰 اضافه سکه"):
+                set_state(cid, "a_addcoin_id")
+                await safe_send(bot, cid, "🆔 کاربر:", keypad=cancel_kb())
+                return
+
+            if txt in ("💳 مشاهده پرداخت‌ها", "💳 پرداخت‌ها"):
+                ps = await list_pending_payments()
+                if not ps:
+                    await safe_send(bot, cid, "📭 خالی.", keypad=admin_menu_kb())
+                    return
+                out = "💳 پرداخت‌ها:\n\n"
+                for pid, upay, plan, am, pr, code in ps:
+                    out += f"🔑 {code}\n👤 {upay[:20]}\n📦 {plan}\n💰 {pr:,}\n➖➖\n"
+                out += "\n✅ تایید [کد]\n❌ رد [کد]"
+                await safe_send(bot, cid, out, keypad=admin_menu_kb())
+                return
+
+            if txt == "🚫 بن کاربر":
+                set_state(cid, "a_ban_user")
+                await safe_send(bot, cid, "🆔 کاربر:", keypad=cancel_kb())
+                return
+
+            if txt == "✅ آنبن کاربر":
+                set_state(cid, "a_unban_user")
+                await safe_send(bot, cid, "🆔 کاربر:", keypad=cancel_kb())
+                return
+
+            if txt in ("✉️ ارسال پیام به کاربر", "✉️ پیام به کاربر"):
+                set_state(cid, "a_msg_id")
+                await safe_send(bot, cid, "🆔 کاربر:", keypad=cancel_kb())
+                return
+
+            if txt in ("⚙️ تنظیم سکه روزانه", "⚙️ سکه روزانه"):
+                set_state(cid, "a_daily")
+                await safe_send(bot, cid, "💰 مقدار:", keypad=cancel_kb())
+                return
+
+            if txt in ("💳 تنظیم شماره کارت", "💳 شماره کارت"):
+                set_state(cid, "a_card")
+                await safe_send(bot, cid, "💳 شماره کارت:", keypad=cancel_kb())
+                return
+
+            if txt == "🎁 ساخت کد هدیه":
+                set_state(cid, "a_g_am")
+                await safe_send(bot, cid, "💰 مقدار:", keypad=cancel_kb())
+                return
+
+            if txt in ("📋 لیست کدهای هدیه", "📋 لیست کدها"):
+                gs = await list_gifts()
+                if not gs:
+                    await safe_send(bot, cid, "📭 خالی.", keypad=admin_menu_kb())
+                    return
+                out = "📋 کدها:\n\n"
+                for code, am, cap in gs:
+                    out += f"• {code} - 💰 {am} | 🔢 {cap}\n"
+                await safe_send(bot, cid, out, keypad=admin_menu_kb())
+                return
+
+            if txt in ("🔐 تغییر رمز مدیریت", "🔐 تغییر رمز"):
+                set_state(cid, "a_pass")
+                await safe_send(bot, cid, "🔑 رمز جدید:", keypad=cancel_kb())
+                return
+
+            if txt == "📨 پیام‌های پشتیبانی":
+                msgs = await list_support_new()
+                if not msgs:
+                    await safe_send(bot, cid, "📭 خالی.", keypad=admin_menu_kb())
+                    return
+                out = "📨 پشتیبانی:\n\n"
+                for mid, uid2, nm, msg in msgs:
+                    out += f"🆕 {mid[:8]}\n👤 {nm}\n📝 {msg}\n\n"
+                out += "پاسخ: /reply [کد] متن"
+                await safe_send(bot, cid, out, keypad=admin_menu_kb())
+                return
+
+            if txt == "📢 پیام همگانی":
+                set_state(cid, "a_bc_maker")
+                await safe_send(bot, cid, "✍️ متن:", keypad=cancel_kb())
+                return
+
+            if txt == "🌍 پیام همگانی فرزندها":
+                set_state(cid, "a_bc_child")
+                await safe_send(bot, cid, "✍️ متن:", keypad=cancel_kb())
+                return
+
+        if is_adm_flag and txt.startswith("/reply"):
+            parts = raw.split(" ", 2)
+            if len(parts) < 3:
+                await safe_send(bot, cid, "❌ /reply [کد] [متن]")
+                return
+            mid = parts[1].strip()
+            reply = parts[2].strip()
+            db = await db_connect()
+            try:
+                async with db.cursor() as c:
+                    await c.execute("SELECT msg_id, user_id FROM support WHERE msg_id LIKE ?",
+                                    (f"{mid}%",))
+                    r = await c.fetchone()
+            finally:
+                await db.close()
+            if not r:
+                await safe_send(bot, cid, "❌ پیدا نشد.")
+                return
+            try:
+                await bot.send_message(r[1], f"📞 پاسخ:\n\n{reply}", chat_keypad=main_menu_kb())
+                await reply_support(r[0], reply)
+                await safe_send(bot, cid, "✅ ارسال شد.", keypad=admin_menu_kb())
+            except Exception as e:
+                await safe_send(bot, cid, f"❌ {e}")
+            return
+
+        if is_adm_flag and (txt.startswith("تایید") or txt.startswith("تأیید")):
+            parts = txt.replace("تأیید", "تایید").split()
+            if len(parts) != 2:
+                await safe_send(bot, cid, "❌ تایید [کد]")
+                return
+            code = parts[1].strip()
+            p = await get_payment_by_code(code)
+            if not p:
+                await safe_send(bot, cid, f"❌ {code} پیدا نشد.")
+                return
+            pid, upay, plan, am, pr = p
+            u = await get_user(upay)
+            if u:
+                await add_coins(upay, int(am))
+                await confirm_payment(pid)
+                await safe_send(bot, cid, f"✅ تایید شد. {am} سکه.", keypad=admin_menu_kb())
+                try:
+                    await bot.send_message(upay, f"💰 تایید! {am} سکه.", chat_keypad=main_menu_kb())
+                except Exception:
+                    pass
+            return
+
+        if is_adm_flag and (txt == "رد" or txt.startswith("رد ")):
+            parts = txt.split()
+            if len(parts) != 2:
+                await safe_send(bot, cid, "❌ رد [کد]")
+                return
+            code = parts[1]
+            p = await get_payment_by_code(code)
+            if not p:
+                await safe_send(bot, cid, f"❌ {code} پیدا نشد.")
+                return
+            await reject_payment(p[0])
+            await safe_send(bot, cid, "❌ رد شد.", keypad=admin_menu_kb())
+            return
+
+        if is_adm_flag:
+            if state == "a_addcoin_id":
+                target, _ = await find_user(txt)
+                if target:
+                    set_state(cid, "a_addcoin_am", target=target)
+                    t = await get_user(target)
+                    await safe_send(bot, cid, f"✅ {t['name']} - 💰 {t['coins']}\n💰 مقدار:",
+                                    keypad=cancel_kb())
+                else:
+                    await safe_send(bot, cid, "❌ پیدا نشد.")
+                return
+
+            if state == "a_addcoin_am":
+                if not txt.isdigit():
+                    await safe_send(bot, cid, "❌ عدد.")
+                    return
+                target = info.get("target")
+                t = await get_user(target)
+                if t:
+                    await add_coins(target, int(txt))
+                    await safe_send(bot, cid, f"✅ {txt} سکه.", keypad=admin_menu_kb())
+                    try:
+                        await bot.send_message(target, f"🎁 {txt} سکه از مدیریت!",
+                                               chat_keypad=main_menu_kb())
+                    except Exception:
+                        pass
+                clear_state(cid)
+                return
+
+            if state == "a_ban_user":
+                target, _ = await find_user(txt)
+                if target:
+                    db = await db_connect()
+                    try:
+                        async with db.cursor() as c:
+                            await c.execute("UPDATE users SET banned=1 WHERE uid=?", (target,))
+                            await db.commit()
+                    finally:
+                        await db.close()
+                    await safe_send(bot, cid, "✅ بن شد.", keypad=admin_menu_kb())
+                else:
+                    await safe_send(bot, cid, "❌ پیدا نشد.")
+                clear_state(cid)
+                return
+
+            if state == "a_unban_user":
+                target, _ = await find_user(txt)
+                if target:
+                    db = await db_connect()
+                    try:
+                        async with db.cursor() as c:
+                            await c.execute("UPDATE users SET banned=0 WHERE uid=?", (target,))
+                            await db.commit()
+                    finally:
+                        await db.close()
+                    await safe_send(bot, cid, "✅ آنبن شد.", keypad=admin_menu_kb())
+                else:
+                    await safe_send(bot, cid, "❌ پیدا نشد.")
+                clear_state(cid)
+                return
+
+            if state == "a_msg_id":
+                target, _ = await find_user(txt)
+                if target:
+                    set_state(cid, "a_msg_text", target=target)
+                    await safe_send(bot, cid, "✍️ متن:", keypad=cancel_kb())
+                else:
+                    await safe_send(bot, cid, "❌ پیدا نشد.")
+                return
+
+            if state == "a_msg_text":
+                target = info.get("target")
+                try:
+                    await bot.send_message(target, f"📩 پیام مدیریت:\n\n{txt}",
+                                           chat_keypad=main_menu_kb())
+                    await safe_send(bot, cid, "✅ ارسال شد.", keypad=admin_menu_kb())
+                except Exception:
+                    await safe_send(bot, cid, "❌ خطا.")
+                clear_state(cid)
+                return
+
+            if state == "a_daily":
+                if txt.isdigit():
+                    await set_setting("daily_coins", int(txt))
+                    await safe_send(bot, cid, f"✅ {txt}", keypad=admin_menu_kb())
+                clear_state(cid)
+                return
+
+            if state == "a_card":
+                await set_setting("card_number", txt.strip())
+                set_state(cid, "a_card_holder")
+                await safe_send(bot, cid, "👤 نام صاحب کارت:", keypad=cancel_kb())
+                return
+
+            if state == "a_card_holder":
+                await set_setting("card_holder", txt.strip())
+                clear_state(cid)
+                await safe_send(bot, cid, "✅ ذخیره شد.", keypad=admin_menu_kb())
+                return
+
+            if state == "a_g_am":
+                if not txt.isdigit():
+                    await safe_send(bot, cid, "❌ عدد.")
+                    return
+                set_state(cid, "a_g_cap", am=int(txt))
+                await safe_send(bot, cid, "🔢 ظرفیت:", keypad=cancel_kb())
+                return
+
+            if state == "a_g_cap":
+                if not txt.isdigit():
+                    await safe_send(bot, cid, "❌ عدد.")
+                    return
+                set_state(cid, "a_g_code", am=info.get("am"), cap=int(txt))
+                await safe_send(bot, cid, "🔑 کد:", keypad=cancel_kb())
+                return
+
+            if state == "a_g_code":
+                code = txt.strip()
+                if len(code) < 3:
+                    await safe_send(bot, cid, "❌ حداقل ۳ کاراکتر.")
+                    return
+                if await create_gift(code, info.get("am"), info.get("cap")):
+                    await safe_send(bot, cid, f"🎁 {code} ساخته شد.", keypad=admin_menu_kb())
+                else:
+                    await safe_send(bot, cid, "❌ خطا.")
+                clear_state(cid)
+                return
+
+            if state == "a_pass":
+                if len(txt) < 3:
+                    await safe_send(bot, cid, "❌ حداقل ۳ کاراکتر.")
+                    return
+                await set_setting("admin_pass", txt.strip())
+                clear_state(cid)
+                await safe_send(bot, cid, "✅ رمز تغییر کرد.", keypad=admin_menu_kb())
+                return
+
+            if state == "a_bc_maker":
+                if contains_bad_word(txt):
+                    await safe_send(bot, cid, "❌ نامناسب.")
+                    clear_state(cid)
+                    return
+                uids = await all_user_ids()
+                ok = 0
+                for u2 in uids:
+                    try:
+                        await bot.send_message(u2, f"📢 {txt}")
+                        ok += 1
+                        await asyncio.sleep(0.05)
+                    except Exception:
+                        pass
+                clear_state(cid)
+                await safe_send(bot, cid, f"✅ {ok}/{len(uids)}", keypad=admin_menu_kb())
+                return
+
+            if state == "a_bc_child":
+                if contains_bad_word(txt):
+                    await safe_send(bot, cid, "❌ نامناسب.")
+                    clear_state(cid)
+                    return
+                db = await db_connect()
+                try:
+                    async with db.cursor() as c:
+                        await c.execute("SELECT bot_id, token FROM bots WHERE is_active=1")
+                        bl = await c.fetchall()
+                        await c.execute("SELECT DISTINCT user_id, bot_id FROM child_users")
+                        mem = await c.fetchall()
+                finally:
+                    await db.close()
+                by_bot = {}
+                for u2, b2 in mem:
+                    by_bot.setdefault(str(b2), set()).add(str(u2))
+                total = 0
+                for bid, tok in bl:
+                    recips = list(by_bot.get(str(bid), set()))
+                    if not recips:
+                        continue
+                    try:
+                        cbot = Bot(tok)
+                        for r in recips:
+                            try:
+                                await cbot.send_message(r, f"📢 {txt}")
+                                total += 1
+                                await asyncio.sleep(0.05)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.warning(f"child bc {bid}: {e}")
+                clear_state(cid)
+                await safe_send(bot, cid, f"✅ ارسال: {total}", keypad=admin_menu_kb())
+                return
+
+        if txt and not txt.startswith("/"):
+            kb = admin_menu_kb() if is_adm_flag else main_menu_kb()
+            await safe_send(bot, cid, "❌ دستور نامعتبر.", keypad=kb)
+
+    except Exception as e:
+        logger.error(f"❌ main_handler: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def cleanup_attempts():
+    while True:
+        await asyncio.sleep(600)
+        now = time.time()
+        for k in list(_admin_attempts.keys()):
+            v = [t for t in _admin_attempts[k] if now - t < 60]
+            if v:
+                _admin_attempts[k] = v
+            else:
+                _admin_attempts.pop(k, None)
+
+
+async def main():
+    logger.info("=" * 60)
+    logger.info("🚀 ربات ساز — MAXRubika")
+    logger.info("=" * 60)
+
+    logger.info("📦 دیتابیس...")
+    await db_init()
+    await init_settings()
+    logger.info("   ✅ آماده")
+
+    logger.info("🤖 ربات‌های فرزند...")
+    db = await db_connect()
+    try:
+        async with db.cursor() as c:
+            await c.execute("""SELECT bot_id, owner_id, token, plain_password, bot_type
+                FROM bots WHERE is_active=1""")
+            bl = await c.fetchall()
+    finally:
+        await db.close()
+
+    for bid, own, tok, pwd, bt in bl:
+        if not pwd:
+            pwd = MAKER_ADMIN_PASS
+        try:
+            await start_child(own, bid, tok, pwd, bt)
+            await asyncio.sleep(0.5)
+            logger.info(f"   ✅ {bt} - {bid[:15]}")
+        except Exception as e:
+            logger.error(f"   ❌ {bid}: {e}")
+
+    cleanup_task = asyncio.create_task(cleanup_attempts())
+
+    logger.info("=" * 60)
+    logger.info(f"📌 آماده | {BOT_MAKERS} | {BOT_SUPPORT}")
+    logger.info("=" * 60)
+
+    try:
+        await main_bot.start()
+    except asyncio.CancelledError:
+        logger.info("👋 متوقف شد.")
+    finally:
+        cleanup_task.cancel()
+        for ok, tasks in list(child_tasks.items()):
+            for bid, t in list(tasks.items()):
+                if not t.done():
+                    t.cancel()
+                    try:
+                        await asyncio.wait_for(t, timeout=3.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                        pass
+        child_tasks.clear()
+        logger.info("✅ پاک‌سازی شد.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("👋 متوقف شد.")
+    except Exception as e:
+        logger.error(f"❌ خطای اصلی: {e}")
+        import traceback
+        traceback.print_exc()
